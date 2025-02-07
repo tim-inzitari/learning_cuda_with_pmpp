@@ -495,8 +495,14 @@ int main(int argc, char **argv) {
            shared_mem_matches ? "PASSED" : "FAILED", shared_mem_max_diff);
     
     // === Test 3: cuBLAS Implementation ===
-    // ... existing cuBLAS setup ...
-    
+    // Set cuBLAS to use highest precision mode
+    cublasStatus_t status;
+    status = cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("Failed to set math mode: %d\n", status);
+        return 1;
+    }
+
     // Time memory transfer
     cudaEventRecord(start);
     cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
@@ -509,7 +515,36 @@ int main(int argc, char **argv) {
     
     // Time computation
     cudaEventRecord(start);
-    // ... existing cuBLAS computation ...
+    
+    // Batch parameters for strided GEMM
+    long long int strideA = (long long int)m * n;
+    long long int strideB = (long long int)k * l;
+    long long int strideC = (long long int)m * l;
+
+    // Use batched strided GEMM with transposed operations to match our layout
+    const float alpha = 1.0f;
+    const float beta = 0.0f;
+    status = cublasSgemmStridedBatched(
+        handle,
+        CUBLAS_OP_T,                // Transpose A
+        CUBLAS_OP_T,                // Transpose B
+        m, l, k,                    // Original dimensions
+        &alpha,                     // Scaling factor for AB
+        d_A, n,                     // Matrix A with leading dimension n
+        strideA,
+        d_B, l,                     // Matrix B with leading dimension l
+        strideB,
+        &beta,                      // Scaling factor for C
+        d_C, m,                     // Output matrix C
+        strideC,
+        batch_size
+    );
+
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("Failed to execute batched GEMM: %d\n", status);
+        return 1;
+    }
+
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&tc_time, start, stop);
