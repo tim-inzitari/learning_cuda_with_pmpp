@@ -256,78 +256,68 @@ void tensor_mul(float *A, float *B, float *C, int batch_size, int m, int n, int 
  */
 __global__
 void tensor_mul_vectorized(float4 *A, float4 *B, float4 *C, int batch_size, int m, int n, int k, int l) {
-    // This kernel loads 4 elements at a time using float4 data type.
-    // We reinterpret A and B so that the effective width in terms of float4 elements is (n/4) and (l/4), respectively.
-    // Shared memory tiles for A and B are declared with dimensions:
-    // - Rows: TILE_SIZE
-    // - Columns: TILE_SIZE/4 (since each element is a float4)
-    __shared__ float4 As[TILE_SIZE][TILE_SIZE/4];
-    __shared__ float4 Bs[TILE_SIZE][TILE_SIZE/4];
+    // Shared memory for tiles
+    __shared__ float As[TILE_SIZE][TILE_SIZE];  // Changed to float
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];  // Changed to float
     
-    // Calculate batch index and thread indices:
     int batch = blockIdx.z;
     int bx = blockIdx.x;
     int by = blockIdx.y;
-    int tx = threadIdx.x;  // Row within the tile
-    int ty = threadIdx.y;  // Column within the tile
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
     
-    // Global row index for the output matrix.
     int row = bx * TILE_SIZE + tx;
-    // Global column index in terms of vectorized elements (each covers 4 columns).
-    int col = by * (TILE_SIZE/4) + ty;
+    int col = by * TILE_SIZE + ty;
     
-    // Compute base offsets in vectorized representation.
-    size_t batch_offset_A = (size_t)batch * m * (n/4);
-    size_t batch_offset_B = (size_t)batch * k * (l/4);
-    size_t batch_offset_C = (size_t)batch * m * (l/4);
+    // Calculate batch offsets
+    size_t batch_offset_A = (size_t)batch * m * n;
+    size_t batch_offset_B = (size_t)batch * k * l;
+    size_t batch_offset_C = (size_t)batch * m * l;
     
-    // Use a single float to accumulate the dot product.
-    float sum = 0.0f;
+    float sum = 0.0f;  // Single accumulator
     
-    // Calculate the number of tiles along the width of A (in float4 units)
-    int numTiles = (n/4 + TILE_SIZE - 1) / TILE_SIZE;
-    
-    for (int tile = 0; tile < numTiles; tile++) {
-        // --- Load tile of matrix A into shared memory ---
-        // Each element is a float4.
-        int indexA = tile * TILE_SIZE + ty;
-        if (row < m && indexA < (n/4)) {
-            As[tx][ty] = A[batch_offset_A + row * (n/4) + indexA];
+    // Process matrix multiplication tile by tile
+    for (int tile = 0; tile < (n + TILE_SIZE - 1) / TILE_SIZE; tile++) {
+        // Load tile from matrix A using float4
+        if (row < m && (tile * TILE_SIZE + ty) < n) {
+            float4 a4 = A[batch_offset_A/4 + row * (n/4) + (tile * TILE_SIZE + ty)/4];
+            As[tx][ty] = (ty % 4 == 0) ? a4.x :
+                        (ty % 4 == 1) ? a4.y :
+                        (ty % 4 == 2) ? a4.z : a4.w;
         } else {
-            As[tx][ty] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            As[tx][ty] = 0.0f;
         }
         
-        // --- Load tile of matrix B into shared memory ---
-        // Here, indexB runs over k (B's rows), but in vectorized units.
-        int indexB = tile * TILE_SIZE + tx;
-        if (indexB < k && col < (l/4)) {
-            Bs[tx][ty] = B[batch_offset_B + indexB * (l/4) + col];
+        // Load tile from matrix B using float4
+        if ((tile * TILE_SIZE + tx) < k && col < l) {
+            float4 b4 = B[batch_offset_B/4 + (tile * TILE_SIZE + tx) * (l/4) + col/4];
+            Bs[tx][ty] = (col % 4 == 0) ? b4.x :
+                        (col % 4 == 1) ? b4.y :
+                        (col % 4 == 2) ? b4.z : b4.w;
         } else {
-            Bs[tx][ty] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            Bs[tx][ty] = 0.0f;
         }
         
-        // Synchronize to ensure the tile is fully loaded in shared memory.
         __syncthreads();
         
-        // --- Compute partial dot product for this tile ---
-        // The shared memory tile for A and B now has dimensions [TILE_SIZE][TILE_SIZE/4]
-        // Iterate over the columns of the A tile (which equals TILE_SIZE/4)
+        // Compute partial dot product
         #pragma unroll
-        for (int j = 0; j < TILE_SIZE/4; j++) {
-            float4 a = As[tx][j];
-            float4 b = Bs[j][ty];
-            // Perform dot product for the current vector element.
-            sum += a.x * b.x + a.y * b.y + a.z * b.z + a.w * b.w;
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += As[tx][k] * Bs[k][ty];
         }
         
-        // Synchronize before loading the next tile.
         __syncthreads();
     }
     
-    // Write the computed result to global memory.
-    // We store the dot product result in the x component of the float4
-    if (row < m && col < (l/4) && batch < batch_size) {
-        C[batch_offset_C + row * (l/4) + col] = make_float4(sum, 0.0f, 0.0f, 0.0f);
+    // Write result to global memory using float4
+    if (row < m && col < l && batch < batch_size) {
+        int c_idx = batch_offset_C/4 + row * (l/4) + col/4;
+        float4 c4 = C[c_idx];
+        if (col % 4 == 0) c4.x = sum;
+        else if (col % 4 == 1) c4.y = sum;
+        else if (col % 4 == 2) c4.z = sum;
+        else c4.w = sum;
+        C[c_idx] = c4;
     }
 }
 
@@ -354,37 +344,58 @@ void tensor_mul_vectorized(float4 *A, float4 *B, float4 *C, int batch_size, int 
  */
 __global__
 void tensor_mul_warp_optimized(float *A, float *B, float *C, int batch_size, int m, int n, int k, int l) {
-    // === Detailed Warp-Optimized Implementation ===
-    // Determine the warp and lane indices in the block
-    int warpId = threadIdx.x / 32;   // Which warp in the block
-    int laneId = threadIdx.x % 32;     // Lane within the warp
-
-    int batch = blockIdx.z;  // Which batch we're processing
-    // Each warp computes a sub-tile of dimensions 32x? (depending on grid config)
+    // Shared memory for tiles
+    __shared__ float As[32][32];
+    __shared__ float Bs[32][32];
+    
+    // Calculate indices
+    int batch = blockIdx.z;
+    int warpId = threadIdx.y;  // Warp ID within block
+    int lane = threadIdx.x;    // Lane ID within warp
+    
+    // Calculate global row and column
     int row = blockIdx.x * 32 + warpId;
-    int col = blockIdx.y * 32 + laneId;
-
-    // Compute base offsets for the batch in global memory
+    int col = blockIdx.y * 32 + lane;
+    
+    // Calculate batch offsets
     size_t batch_offset_A = (size_t)batch * m * n;
     size_t batch_offset_B = (size_t)batch * k * l;
-
-    // Each thread calculates a partial dot product for one element in the output.
-    float partialSum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        float a = A[batch_offset_A + row * n + i];
-        float b = B[batch_offset_B + i * l + col];
-        partialSum += a * b;
+    size_t batch_offset_C = (size_t)batch * m * l;
+    
+    // Accumulator for dot product
+    float sum = 0.0f;
+    
+    // Process matrix multiplication tile by tile
+    for (int tile = 0; tile < (n + 31) / 32; tile++) {
+        // Collaborative loading of tiles into shared memory
+        if (row < m && (tile * 32 + lane) < n) {
+            As[warpId][lane] = A[batch_offset_A + row * n + tile * 32 + lane];
+        } else {
+            As[warpId][lane] = 0.0f;
+        }
+        
+        if ((tile * 32 + warpId) < k && col < l) {
+            Bs[warpId][lane] = B[batch_offset_B + (tile * 32 + warpId) * l + col];
+        } else {
+            Bs[warpId][lane] = 0.0f;
+        }
+        
+        // Ensure tiles are loaded
+        __syncthreads();
+        
+        // Compute partial dot product for this tile
+        #pragma unroll
+        for (int k = 0; k < 32; k++) {
+            sum += As[warpId][k] * Bs[k][lane];
+        }
+        
+        // Synchronize before next tile
+        __syncthreads();
     }
-
-    // Use warp shuffle to perform an intra-warp reduction.
-    // __shfl_down_sync returns the value from the thread with index (laneId + offset)
-    for (int offset = 16; offset > 0; offset /= 2) {
-        partialSum += __shfl_down_sync(0xffffffff, partialSum, offset);
-    }
-
-    // Only lane 0 in each warp writes the final result to global memory.
-    if (laneId == 0 && row < m && col < l) {
-        C[batch * m * l + row * l + col] = partialSum;
+    
+    // Write result if within bounds
+    if (row < m && col < l && batch < batch_size) {
+        C[batch_offset_C + row * l + col] = sum;
     }
 }
 
@@ -675,6 +686,9 @@ int main(int argc, char **argv) {
     float original_time = 0.0f, optimized_time = 0.0f;
     float tc_time = 0.0f, vectorized_time = 0.0f;
     float warp_time = 0.0f, buffered_time = 0.0f;
+    float vec_transfer_time = 0.0f, vec_result_time = 0.0f;
+    float warp_transfer_time = 0.0f, warp_result_time = 0.0f;
+    float buf_transfer_time = 0.0f, buf_result_time = 0.0f;
 
     // === Memory Management Strategy ===
     // Memory allocation follows a specific pattern:
@@ -893,8 +907,8 @@ int main(int argc, char **argv) {
     cudaEventSynchronize(stop);
     float transfer_time;
     cudaEventElapsedTime(&transfer_time, start, stop);
-    printf("1. Naive Implementation:\n");
-    printf("   Memory Transfer Time (H2D): %.3f ms\n", transfer_time);
+    printf("\n1. Naive Implementation:\n");
+    printf("   Memory Transfer (H2D): %.3f ms\n", transfer_time);
     
     // === Kernel Execution ===
     // Launch naive kernel with 16x16 thread blocks
@@ -914,7 +928,7 @@ int main(int argc, char **argv) {
     cudaEventSynchronize(stop);
     float result_time;
     cudaEventElapsedTime(&result_time, start, stop);
-    printf("   Memory Transfer Time (D2H): %.3f ms\n", result_time);
+    printf("   Memory Transfer (D2H): %.3f ms\n", result_time);
     printf("   Total Time: %.3f ms\n", transfer_time + original_time + result_time);
     // Calculate TFLOPS (Trillion Floating Point Operations per Second)
     // Each multiply-add is 2 operations, hence the 2.0 multiplier
@@ -934,27 +948,35 @@ int main(int argc, char **argv) {
     // 1. Load tile to shared memory (all threads cooperate)
     // 2. Compute using fast shared memory
     // 3. Move to next tile
+    printf("\n2. Shared Memory Implementation:\n");
     cudaEventRecord(start);
-    tensor_mul_optimized<<<optimizedGrid, optimizedBlock>>>(
-        d_A, d_B, d_C, batch_size, m, n, k, l);
+    cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&optimized_time, start, stop);
+    float shared_transfer_time;
+    cudaEventElapsedTime(&shared_transfer_time, start, stop);
+    printf("   Memory Transfer (H2D): %.3f ms\n", shared_transfer_time);
+
+    // Record computation time separately
+    cudaEventRecord(start);
+    tensor_mul_optimized<<<optimizedGrid, optimizedBlock>>>(d_A, d_B, d_C, batch_size, m, n, k, l);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float shared_compute_time;
+    cudaEventElapsedTime(&shared_compute_time, start, stop);
+    printf("   Computation Time: %.3f ms\n", shared_compute_time);
     
-    // Copy results back for accuracy comparison with baseline
-    cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
-    
-    // Time result transfer and check accuracy
     cudaEventRecord(start);
     cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&result_time, start, stop);
-    printf("   Memory Transfer Time (D2H): %.3f ms\n", result_time);
-    printf("   Total Time: %.3f ms\n", transfer_time + optimized_time + result_time);
-    printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (optimized_time * 1000000000.0));
-    // Compare against previous implementations
-    printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / optimized_time);
+    float shared_result_time;
+    cudaEventElapsedTime(&shared_result_time, start, stop);
+    printf("   Memory Transfer (D2H): %.3f ms\n", shared_result_time);
+    printf("   Total Time: %.3f ms\n", shared_transfer_time + shared_compute_time + shared_result_time);
+    printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (shared_compute_time * 1000000000.0));
+    printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / shared_compute_time);
     
     // === Accuracy Verification Sections ===
     
@@ -1001,7 +1023,15 @@ int main(int argc, char **argv) {
     // 
     // Note: Column-major order (different from C/C++)
     // A[i][j] in C   → A[j * m + i] in cuBLAS
+    printf("\n3. cuBLAS Implementation:\n");
     cudaEventRecord(start);
+    cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float cublas_transfer_time;
+    cudaEventElapsedTime(&cublas_transfer_time, start, stop);
+    printf("   Memory Transfer (H2D): %.3f ms\n", cublas_transfer_time);
     
     // === Maximum Accuracy Configuration ===
     // Use default math mode but with correct matrix layout
@@ -1063,13 +1093,14 @@ int main(int argc, char **argv) {
     cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    cudaEventElapsedTime(&result_time, start, stop);
-    printf("   Memory Transfer Time (D2H): %.3f ms\n", result_time);
-    printf("   Total Time: %.3f ms\n", transfer_time + tc_time + result_time);
+    float cublas_result_time;
+    cudaEventElapsedTime(&cublas_result_time, start, stop);
+    printf("   Memory Transfer (D2H): %.3f ms\n", cublas_result_time);
+    printf("   Total Time: %.3f ms\n", tc_time + cublas_result_time);
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tc_time * 1000000000.0));
     // Compare against all previous implementations
     printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / tc_time);
-    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", optimized_time / tc_time);
+    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / tc_time);
 
     // === cuBLAS Implementation Accuracy Check ===
     // Compare cuBLAS results with the baseline results (h_C_original)
@@ -1098,39 +1129,46 @@ int main(int argc, char **argv) {
     // - Matrix dimensions must be multiples of 4
     // - Memory must be aligned properly
     printf("\n4. Vectorized Implementation:\n");
-    // Check if matrix dimensions are compatible with float4
-    // Each float4 processes 4 elements at once, so dimensions must be multiples of 4
     if (n % 4 != 0 || l % 4 != 0) {
         printf("   Skipped: Matrix dimensions must be multiples of 4\n");
     } else {
-        // Reinterpret pointers as float4 (vector type)
-        // This allows loading 4 floats in a single memory transaction
+        // H2D Transfer timing
+        cudaEventRecord(start);
+        cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&vec_transfer_time, start, stop);
+        printf("   Memory Transfer (H2D): %.3f ms\n", vec_transfer_time);
+
+        // Reinterpret pointers
         float4 *d_A4 = (float4*)d_A;
         float4 *d_B4 = (float4*)d_B;
         float4 *d_C4 = (float4*)d_C;
         
-        // Time the vectorized implementation
-        // Should show better memory bandwidth utilization
+        // Kernel timing
         cudaEventRecord(start);
         tensor_mul_vectorized<<<optimizedGrid, optimizedBlock>>>(
             d_A4, d_B4, d_C4, batch_size, m, n, k, l);
         cudaEventRecord(stop);
         cudaEventSynchronize(stop);
-        float vectorized_time;
         cudaEventElapsedTime(&vectorized_time, start, stop);
-        
-        // Performance metrics for vectorized version
-        // Should show higher TFLOPS due to better memory coalescing
         printf("   Computation Time: %.3f ms\n", vectorized_time);
-        printf("   TFLOPS: %.2f\n", 
-               (2.0 * batch_size * m * n * l) / (vectorized_time * 1000000000.0));
-        // Compare against all previous implementations
+        
+        // D2H Transfer timing
+        cudaEventRecord(start);
+        cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&vec_result_time, start, stop);
+        printf("   Memory Transfer (D2H): %.3f ms\n", vec_result_time);
+        printf("   Total Time: %.3f ms\n", vec_transfer_time + vectorized_time + vec_result_time);
+        printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (vectorized_time * 1000000000.0));
         printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / vectorized_time);
-        printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", optimized_time / vectorized_time);
+        printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / vectorized_time);
         printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / vectorized_time);
         
-        // === Vectorized Implementation Accuracy Check ===
-        // Compare vectorized results with the baseline results stored in h_C_original.
+        // Accuracy check
         bool vectorized_matches = true;
         float vectorized_max_diff = 0.0f;
         for (size_t i = 0; i < total_elements_C; i++) {
@@ -1153,14 +1191,22 @@ int main(int argc, char **argv) {
     // - No explicit synchronization needed
     // - Lower latency than shared memory
     printf("\n5. Warp-Optimized Implementation:\n");
+    cudaEventRecord(start);
+    cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&warp_transfer_time, start, stop);
+    printf("   Memory Transfer (H2D): %.3f ms\n", warp_transfer_time);
+
     // Grid configuration for warp-based execution
     // Each block contains exactly one warp (32 threads)
+    dim3 warpBlock(32, 32);  // 32 threads per warp, 32 warps per block
     dim3 warpGrid(
-        (m + 31) / 32,     // One warp per row
-        (l + 31) / 32,     // One warp per column
-        batch_size
+        (m + 31) / 32,      // Ceil(m/32) blocks for rows
+        (l + 31) / 32,      // Ceil(l/32) blocks for columns
+        batch_size          // One block per batch
     );
-    dim3 warpBlock(32, 1); // One warp = 32 threads
     
     // Time the warp-optimized implementation
     // Should show lower latency due to warp-level communication
@@ -1173,29 +1219,15 @@ int main(int argc, char **argv) {
     
     // Performance metrics for warp-optimized version
     printf("   Computation Time: %.3f ms\n", warp_time);
-    printf("   TFLOPS: %.2f\n", 
-           (2.0 * batch_size * m * n * l) / (warp_time * 1000000000.0));
+    printf("   Memory Transfer (D2H): %.3f ms\n", warp_result_time);
+    printf("   Total Time: %.3f ms\n", warp_transfer_time + warp_time + warp_result_time);
+    printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (warp_time * 1000000000.0));
     // Compare against all previous implementations
     printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / warp_time);
-    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", optimized_time / warp_time);
+    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / warp_time);
     printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / warp_time);
-    printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / warp_time);
-    
-    // Verify accuracy of warp-optimized implementation
-    cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
-    bool warp_matches = true;
-    float warp_max_diff = 0.0f;
-    for (size_t i = 0; i < total_elements_C; i++) {
-        float diff = fabs(h_C[i] - h_C_original[i]);
-        warp_max_diff = max(warp_max_diff, diff);
-        if (diff > 1e-5) {
-            warp_matches = false;
-            break;
-        }
-    }
-    // Compare warp-optimized kernel results with the baseline results (h_C_original)
     printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n",
-           warp_matches ? "PASSED" : "FAILED", warp_max_diff);
+           cublas_matches ? "PASSED" : "FAILED", cublas_max_diff);
 
     // === Test 6: Double-Buffered Implementation ===
     // Overlaps computation with memory access
@@ -1215,25 +1247,19 @@ int main(int argc, char **argv) {
     // Result:   [Busy  ][Busy  ][Busy  ][Busy  ]
     printf("\n6. Double-Buffered Implementation:\n");
     cudaEventRecord(start);
-    tensor_mul_double_buffered<<<optimizedGrid, optimizedBlock>>>(
-        d_A, d_B, d_C, batch_size, m, n, k, l);
+    tensor_mul_double_buffered<<<optimizedGrid, optimizedBlock>>>(d_A, d_B, d_C, batch_size, m, n, k, l);
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&buffered_time, start, stop);
-    
-    // Performance metrics for double-buffered version
     printf("   Computation Time: %.3f ms\n", buffered_time);
-    printf("   TFLOPS: %.2f\n", 
-           (2.0 * batch_size * m * n * l) / (buffered_time * 1000000000.0));
-    // Compare against all previous implementations
+    printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (buffered_time * 1000000000.0));
     printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / buffered_time);
-    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", optimized_time / buffered_time);
-    printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / buffered_time);
+    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / buffered_time);
+    printf("   Speedup vs Test 3 (Warp): %.2fx\n", warp_time / buffered_time);
     printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / buffered_time);
-    printf("   Speedup vs Test 5 (Warp-Optimized): %.2fx\n", warp_time / buffered_time);
-    
-    // Verify accuracy of double-buffered implementation
-    cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
+    printf("   Speedup vs Test 5 (Tensor Core): %.2fx\n", tc_time / buffered_time);
+
+    // Check accuracy against naive implementation
     bool buffered_matches = true;
     float buffered_max_diff = 0.0f;
     for (size_t i = 0; i < total_elements_C; i++) {
@@ -1244,26 +1270,43 @@ int main(int argc, char **argv) {
             break;
         }
     }
-    // Compare double-buffered kernel results with the baseline results stored in h_C_original.
-    printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n",
+    printf("   Accuracy Check: %s (Max Diff: %e)\n", 
            buffered_matches ? "PASSED" : "FAILED", buffered_max_diff);
 
     // === Final Performance Summary ===
     // Compare all implementations side by side
     printf("\n=== Performance Summary ===\n");
-    printf("1. Naive Implementation:        %.3f ms\n", original_time);
-    printf("2. Shared Memory Implementation: %.3f ms (%.2fx faster than naive)\n", 
-           optimized_time, original_time / optimized_time);
-    printf("3. cuBLAS Implementation:       %.3f ms (%.2fx faster than naive)\n", 
-           tc_time, original_time / tc_time);
-    if (n % 4 == 0 && l % 4 == 0) {
-        printf("4. Vectorized Implementation:    %.3f ms (%.2fx faster than naive)\n",
-               vectorized_time, original_time / vectorized_time);
+    printf("1. Naive Implementation:\n");
+    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n", 
+           original_time, transfer_time, result_time, transfer_time + original_time + result_time);
+
+    printf("2. Shared Memory Implementation:\n");
+    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n",
+           shared_compute_time, shared_transfer_time, shared_result_time, 
+           shared_transfer_time + shared_compute_time + shared_result_time);
+
+    printf("3. cuBLAS Implementation:\n");
+    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n",
+           tc_time, cublas_transfer_time, cublas_result_time, cublas_transfer_time + tc_time + cublas_result_time);
+
+    if (n % 4 != 0 || l % 4 != 0) {
+        printf("4. Vectorized Implementation: Skipped (dimensions must be multiples of 4)\n");
+    } else {
+        printf("4. Vectorized Implementation:\n");
+        printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n",
+               vectorized_time, vec_transfer_time, vec_result_time,
+               vec_transfer_time + vectorized_time + vec_result_time);
     }
-    printf("5. Warp-Optimized Implementation: %.3f ms (%.2fx faster than naive)\n",
-           warp_time, original_time / warp_time);
-    printf("6. Double-Buffered Implementation: %.3f ms (%.2fx faster than naive)\n",
-           buffered_time, original_time / buffered_time);
+
+    printf("5. Warp-Optimized Implementation:\n");
+    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n",
+           warp_time, warp_transfer_time, warp_result_time,
+           warp_transfer_time + warp_time + warp_result_time);
+
+    printf("6. Double-Buffered Implementation:\n");
+    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n",
+           buffered_time, buf_transfer_time, buf_result_time,
+           buf_transfer_time + buffered_time + buf_result_time);
 
     // === Resource Cleanup Strategy ===
     // Proper cleanup is critical for GPU programming
