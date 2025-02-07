@@ -1,0 +1,44 @@
+# CUDA binaries and compiled objects
+*.obj
+*.o
+*.so
+*.a
+*.lib
+*.dll
+*.dylib
+*.exp
+*.pdb
+*.exe
+
+# CUDA build directories
+/build/
+/dist/
+/Debug/
+/Release/
+/x64/
+/bin/
+/lib/
+/out/
+
+# NVIDIA Cache files
+.nv/
+
+# CMake build artifacts
+CMakeCache.txt
+CMakeFiles/
+/cmake-build-debug/
+/Makefile
+*.cmake
+*.ninja
+*.vcxproj*
+*.sln
+
+# Python virtual environment
+venv/
+.env/
+
+# Logs & OS files
+logs/
+*.log
+*.DS_Store
+Thumbs.db
