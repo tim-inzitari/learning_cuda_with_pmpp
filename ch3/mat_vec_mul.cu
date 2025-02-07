@@ -1,3 +1,4 @@
+// Hi
 #include <stdio.h>
 #include <cuda.h>
 #include <time.h>

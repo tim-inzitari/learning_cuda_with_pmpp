@@ -44,3 +44,30 @@ logs/
 *.DS_Store
 Thumbs.db
 
+# CUDA build artifacts
+*.out
+*.o
+*.ptx
+*.cubin
+
+# Executables
+mat_vec_mul
+mat_mul
+tensor_mul
+
+# Temporary files
+*.tmp
+
+# Debug files
+*.debug
+
+# IDE/Editor specific
+.vscode/
+.idea/
+*.swp
+*~
+
+# System specific
+.DS_Store
+Thumbs.db
+

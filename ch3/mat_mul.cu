@@ -18,6 +18,31 @@ void mat_mul(float *A, float *B, float *C, int m, int n, int k, int l){
     
 }
 
+__global__
+void row_output(float *A, float *B, float *C, int m, int n, int k, int l, int row) {
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (col < l) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) {
+            sum += A[row * n + i] * B[i * l + col];
+        }
+        C[row * l + col] = sum;
+    }
+}
+
+__global__
+void col_output(float *A, float *B, float *C, int m, int n, int k, int l, int col) {
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row < m) {
+        float sum = 0.0f;
+        for (int i = 0; i < n; i++) {
+            sum += A[row * n + i] * B[i * l + col];
+        }
+        C[row * l + col] = sum;
+    }
+}
 
 int main(int argc, char **argv)
 {
@@ -133,6 +158,62 @@ int main(int argc, char **argv)
     free(h_A);
     free(h_B);
     free(h_C);
+
+    printf("\n=== Performance Comparison ===\n");
+
+    // 1. Full Matrix Multiplication
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    dim3 fullBlock(32, 32);
+    dim3 fullGrid((m + fullBlock.x - 1) / fullBlock.x, 
+                  (l + fullBlock.y - 1) / fullBlock.y);
+    mat_mul<<<fullGrid, fullBlock>>>(d_A, d_B, d_C, m, n, k, l);
+
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float full_time;
+    cudaEventElapsedTime(&full_time, start, stop);
+    printf("Full matrix multiplication time: %.3f ms\n", full_time);
+
+    // 2. Row-by-row Multiplication
+    cudaEventRecord(start);
+    
+    dim3 rowBlock(256);
+    for(int i = 0; i < m; i++) {
+        dim3 rowGrid((l + rowBlock.x - 1) / rowBlock.x);
+        row_output<<<rowGrid, rowBlock>>>(d_A, d_B, d_C, m, n, k, l, i);
+    }
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float row_time;
+    cudaEventElapsedTime(&row_time, start, stop);
+    printf("Row-by-row multiplication time: %.3f ms\n", row_time);
+
+    // 3. Column-by-column Multiplication
+    cudaEventRecord(start);
+    
+    dim3 colBlock(256);
+    for(int j = 0; j < l; j++) {
+        dim3 colGrid((m + colBlock.x - 1) / colBlock.x);
+        col_output<<<colGrid, colBlock>>>(d_A, d_B, d_C, m, n, k, l, j);
+    }
+    
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    float col_time;
+    cudaEventElapsedTime(&col_time, start, stop);
+    printf("Column-by-column multiplication time: %.3f ms\n", col_time);
+
+    // Print speedup comparisons
+    printf("\nSpeedup Analysis:\n");
+    printf("Row-by-row vs Full: %.2fx slower\n", row_time / full_time);
+    printf("Column-by-column vs Full: %.2fx slower\n", col_time / full_time);
+    printf("Column vs Row: %.2fx %s\n", 
+           fabs(col_time / row_time), 
+           col_time > row_time ? "slower" : "faster");
 
     return 0;
 }
