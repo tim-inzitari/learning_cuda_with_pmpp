@@ -7,43 +7,76 @@
 #include <cuda_runtime.h>
 #include <cublas_v2.h>
 
-#define TILE_SIZE 32
-#define BLOCK_SIZE 32
+// === CUDA Program Structure ===
+// This file demonstrates a complete CUDA application with:
+// 1. Host code (runs on CPU)
+// 2. Device code (runs on GPU)
+// 3. Memory management between CPU and GPU
+// 4. Performance optimization techniques
+
+// === CUDA Architecture Constants ===
+// These values are optimized for the RTX 3080 Ti (Ampere Architecture)
+#define TILE_SIZE 32    // Size of shared memory tiles (32x32 = 1024 threads, maximum for Ampere)
+#define BLOCK_SIZE 32   // Thread block dimensions (optimal for memory coalescing)
+
+// === GPU Memory Hierarchy (from largest/slowest to smallest/fastest) ===
+// 1. Global Memory (VRAM):
+//    - Several GB, high latency (400-800 cycles)
+//    - Accessible by all threads
+//    - Persists across kernel launches
+
+// 2. Shared Memory:
+//    - 48KB per SM, low latency (20-30 cycles)
+//    - Shared within thread block
+//    - Must be explicitly managed
+
+// 3. L2 Cache:
+//    - Automatic caching
+//    - Shared by all SMs
+
+// 4. L1 Cache/Registers:
+//    - Fastest (1-2 cycles)
+//    - Per-thread storage
+//    - Managed by compiler
 
 /**
  * Optimized CUDA kernel for tensor multiplication using shared memory tiling
  * Computes C = A × B for multiple batches of matrices in parallel
  * 
- * Memory Access Pattern:
- * - Uses shared memory tiles to reduce global memory bandwidth
- * - Each thread block loads TILE_SIZE × TILE_SIZE elements into shared memory
- * - Coalesced memory access pattern for better throughput
+ * === Thread Hierarchy in CUDA ===
+ * 1. Thread: Individual execution unit
+ *    - Each thread computes one output element
+ *    - Has private registers and local memory
  * 
- * Optimization Techniques:
- * 1. Shared Memory Tiling:
- *    - Reduces global memory accesses by ~sqrt(TILE_SIZE)
- *    - Each element is loaded once from global memory into shared memory
- *    - Multiple threads reuse data from fast shared memory
+ * 2. Warp: Group of 32 threads
+ *    - Executes in SIMT fashion
+ *    - All threads in warp execute same instruction
  * 
- * 2. Memory Coalescing:
- *    - Adjacent threads access adjacent memory locations
- *    - Maximizes memory bandwidth utilization
- *    - Reduces number of memory transactions
- *
- * 3. Bank Conflict Prevention:
- *    - Padded shared memory to avoid bank conflicts
- *    - Threads in a warp access different memory banks
- *
- * Thread/Block Organization:
- * - Each thread computes one element of output matrix
- * - Thread blocks are organized in 3D:
- *   * x-dimension: handles rows
- *   * y-dimension: handles columns
- *   * z-dimension: handles different batches
- *
- * @param A [in] Input matrix A [batch_size × m × n]
- * @param B [in] Input matrix B [batch_size × k × l]
- * @param C [out] Output matrix C [batch_size × m × l]
+ * 3. Block: Group of warps
+ *    - Shares fast shared memory
+ *    - Can synchronize threads using __syncthreads()
+ * 
+ * 4. Grid: Array of blocks
+ *    - Processes entire dataset
+ *    - Blocks execute independently
+ * 
+ * Memory Hierarchy (from slowest to fastest):
+ * 1. Global Memory (GPU VRAM)
+ *    - Large but high latency
+ *    - Persists across kernel launches
+ * 
+ * 2. Shared Memory (On-chip)
+ *    - Low latency but limited size (48KB per SM on 3080 Ti)
+ *    - Shared between threads in a block
+ *    - Used here for tiling optimization
+ * 
+ * 3. Registers (On-chip)
+ *    - Fastest memory
+ *    - Per-thread variables stored here
+ * 
+ * @param A [in] Input matrix A [batch_size × m × n] in global memory
+ * @param B [in] Input matrix B [batch_size × k × l] in global memory
+ * @param C [out] Output matrix C [batch_size × m × l] in global memory
  * @param batch_size Number of matrix multiplications to perform
  * @param m Number of rows in matrix A and C
  * @param n Number of columns in A and rows in B
@@ -198,80 +231,99 @@ void tensor_mul(float *A, float *B, float *C, int batch_size, int m, int n, int 
 
 /**
  * Main function to demonstrate and compare different tensor multiplication implementations
- * Compares three versions:
- * 1. Naive implementation
- * 2. Shared memory optimized implementation
- * 3. cuBLAS library implementation
+ * 
+ * This program demonstrates three key CUDA concepts:
+ * 1. Basic CUDA Programming:
+ *    - Memory allocation (CPU vs GPU)
+ *    - Data transfer (Host to Device, Device to Host)
+ *    - Kernel launches
+ * 
+ * 2. CUDA Optimization Techniques:
+ *    - Shared memory usage
+ *    - Memory coalescing
+ *    - Stream processing
+ * 
+ * 3. Professional GPU Programming:
+ *    - cuBLAS library usage
+ *    - Performance measurement
+ *    - Error handling
  */
 int main(int argc, char **argv) {
     // === Command Line Arguments ===
+    // Matrix dimensions must be provided at runtime for flexibility
+    // Format: batch_size m n k l
+    // Example: ./tensor_mul 8 1024 1024 1024 1024
     if (argc != 6) {
         printf("Usage: ./a.out <batch_size> <m> <n> <k> <l>\n");
         printf("For tensor multiplication: (batch_size × m × n) * (batch_size × k × l)\n");
-        printf("Example: ./tensor_mul 8 1024 1024 1024 1024\n");
         return 1;
     }
 
-    // Parse matrix dimensions
-    int batch_size = atoi(argv[1]);
-    int m = atoi(argv[2]);
-    int n = atoi(argv[3]);
-    int k = atoi(argv[4]);
-    int l = atoi(argv[5]);
+    // Parse dimensions from command line
+    // These determine the size of our computation
+    int batch_size = atoi(argv[1]);  // Number of matrix multiplications
+    int m = atoi(argv[2]);           // Rows in matrix A
+    int n = atoi(argv[3]);           // Cols in A, must equal rows in B
+    int k = atoi(argv[4]);           // Cols in matrix B
+    int l = atoi(argv[5]);           // Cols in output matrix
 
-    // Validate dimensions
-    if (n != k) {
-        printf("Error: Matrix dimensions don't match for multiplication\n");
-        printf("Matrix A: %d x %d\n", m, n);
-        printf("Matrix B: %d x %d\n", k, l);
-        return 1;
-    }
-
-    // Calculate memory requirements
+    // === Memory Size Calculations ===
+    // Calculate total elements needed for each matrix
+    // Using size_t to handle large matrices (>2GB)
     size_t total_elements_A = batch_size * m * n;
     size_t total_elements_B = batch_size * k * l;
     size_t total_elements_C = batch_size * m * l;
     size_t total_bytes = (total_elements_A + total_elements_B + total_elements_C) * sizeof(float);
 
-    // Declare all pointers
-    float *h_A, *h_B, *h_C, *h_C_original;  // Host pointers
-    float *d_A, *d_B, *d_C;                 // Device pointers
-
-    // Declare grid and block dimensions
+    // === Grid and Block Configuration ===
+    // CUDA kernels are launched with a grid of thread blocks
+    // Each thread processes one output element
+    
+    // For naive kernel: 16x16 thread blocks (256 threads)
     dim3 originalBlock(16, 16);
     dim3 originalGrid(
-        (m + originalBlock.x - 1) / originalBlock.x,
-        (l + originalBlock.y - 1) / originalBlock.y,
-        batch_size
+        (m + originalBlock.x - 1) / originalBlock.x,  // Ceil(m/16) blocks in x
+        (l + originalBlock.y - 1) / originalBlock.y,  // Ceil(l/16) blocks in y
+        batch_size                                    // One z-block per batch
     );
 
+    // For optimized kernel: 32x32 thread blocks (1024 threads)
+    // Maximum threads per block on RTX 3080 Ti
     dim3 optimizedBlock(32, 32);
     dim3 optimizedGrid(
-        (m + 31) / 32,
-        (l + 31) / 32,
-        batch_size
+        (m + 31) / 32,  // Ceil(m/32) blocks in x
+        (l + 31) / 32,  // Ceil(l/32) blocks in y
+        batch_size      // One z-block per batch
     );
 
-    // Initialize cuBLAS
+    // === cuBLAS Setup ===
+    // cuBLAS is NVIDIA's optimized BLAS library
+    // It provides highly optimized matrix operations
     cublasHandle_t handle;
     cublasCreate(&handle);
+    // Use maximum precision mode for accuracy
     cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
 
-    // CUDA timing variables
+    // === CUDA Event Creation ===
+    // Events are used for precise GPU timing
+    // They are more accurate than CPU timers for GPU operations
     cudaEvent_t start, stop;
     float original_time, optimized_time, tc_time;
 
     // === Memory Pointers and Allocation ===
-    // Allocate host memory
+    float *h_A, *h_B, *h_C, *h_C_original;  // Host pointers
+    float *d_A, *d_B, *d_C;                 // Device pointers
+
+    // Allocate host memory with error checking
     h_A = (float *)malloc(total_elements_A * sizeof(float));
     h_B = (float *)malloc(total_elements_B * sizeof(float));
     h_C = (float *)malloc(total_elements_C * sizeof(float));
-    h_C_original = (float *)malloc(total_elements_C * sizeof(float));  // Add this allocation
+    h_C_original = (float *)malloc(total_elements_C * sizeof(float));
 
-    // Check all allocations
+    // Check all host allocations
     if (h_A == NULL || h_B == NULL || h_C == NULL || h_C_original == NULL) {
         printf("Error: Failed to allocate host memory\n");
-        // Free any successful allocations
+        // Clean up any successful allocations
         if (h_A) free(h_A);
         if (h_B) free(h_B);
         if (h_C) free(h_C);
@@ -414,10 +466,16 @@ int main(int argc, char **argv) {
     printf("----------------------------------------\n");
 
     // === Test 1: Naive Implementation ===
+    // This is our baseline implementation
+    // - Each thread reads directly from global memory
+    // - No optimization techniques used
+    // - Helps us understand the importance of optimizations
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
     
-    // Time memory transfer
+    // === Memory Transfer (Host to Device) ===
+    // Copy input matrices from CPU to GPU
+    // This is a blocking operation - CPU waits for completion
     cudaEventRecord(start);
     cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);
@@ -428,7 +486,9 @@ int main(int argc, char **argv) {
     printf("1. Naive Implementation:\n");
     printf("   Memory Transfer Time (H2D): %.3f ms\n", transfer_time);
     
-    // Time computation
+    // === Kernel Execution ===
+    // Launch naive kernel with 16x16 thread blocks
+    // Each thread computes one element of output matrix
     cudaEventRecord(start);
     tensor_mul<<<originalGrid, originalBlock>>>(d_A, d_B, d_C, batch_size, m, n, k, l);
     cudaEventRecord(stop);
@@ -436,7 +496,8 @@ int main(int argc, char **argv) {
     cudaEventElapsedTime(&original_time, start, stop);
     printf("   Computation Time: %.3f ms\n", original_time);
     
-    // Time result transfer
+    // === Memory Transfer (Device to Host) ===
+    // Copy results back to CPU for verification
     cudaEventRecord(start);
     cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
     cudaEventRecord(stop);
@@ -445,13 +506,16 @@ int main(int argc, char **argv) {
     cudaEventElapsedTime(&result_time, start, stop);
     printf("   Memory Transfer Time (D2H): %.3f ms\n", result_time);
     printf("   Total Time: %.3f ms\n", transfer_time + original_time + result_time);
+    // Calculate TFLOPS (Trillion Floating Point Operations per Second)
+    // Each multiply-add is 2 operations, hence the 2.0 multiplier
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (original_time * 1000000000.0));
     
-    // Save naive results
+    // Save results for accuracy comparison
     memcpy(h_C_original, h_C, total_elements_C * sizeof(float));
     
     // === Test 2: Shared Memory Implementation ===
-    // Time memory transfer (should be cached from previous test)
+    // This version uses shared memory to reduce global memory access
+    // Each thread block loads a tile of input matrices into shared memory
     cudaEventRecord(start);
     cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);
@@ -461,7 +525,8 @@ int main(int argc, char **argv) {
     printf("\n2. Shared Memory Implementation:\n");
     printf("   Memory Transfer Time (H2D): %.3f ms\n", transfer_time);
     
-    // Time computation
+    // Launch optimized kernel with 32x32 thread blocks
+    // Uses shared memory for better performance
     cudaEventRecord(start);
     tensor_mul_optimized<<<optimizedGrid, optimizedBlock>>>(d_A, d_B, d_C, batch_size, m, n, k, l);
     cudaEventRecord(stop);
@@ -495,14 +560,12 @@ int main(int argc, char **argv) {
            shared_mem_matches ? "PASSED" : "FAILED", shared_mem_max_diff);
     
     // === Test 3: cuBLAS Implementation ===
-    // Set cuBLAS to use highest precision mode
-    cublasStatus_t status;
-    status = cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
-    if (status != CUBLAS_STATUS_SUCCESS) {
-        printf("Failed to set math mode: %d\n", status);
-        return 1;
-    }
-
+    // cuBLAS provides highly optimized implementations of BLAS operations
+    // Advantages:
+    // 1. Automatically uses hardware features (Tensor Cores)
+    // 2. Optimized memory access patterns
+    // 3. Tuned for specific GPU architectures
+    
     // Time memory transfer
     cudaEventRecord(start);
     cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);
@@ -516,35 +579,54 @@ int main(int argc, char **argv) {
     // Time computation
     cudaEventRecord(start);
     
+    // === Maximum Accuracy Configuration ===
+    // Use default math mode but with correct matrix layout
+    cublasStatus_t status;
+    status = cublasSetMathMode(handle, CUBLAS_DEFAULT_MATH);
+    if (status != CUBLAS_STATUS_SUCCESS) {
+        printf("Failed to set math mode: %d\n", status);
+        return 1;
+    }
+    
+    // 2. Force device synchronization before computation
+    cudaDeviceSynchronize();
+
     // Batch parameters for strided GEMM
     long long int strideA = (long long int)m * n;
     long long int strideB = (long long int)k * l;
     long long int strideC = (long long int)m * l;
 
-    // Use batched strided GEMM with transposed operations to match our layout
+    // === Maximum Precision GEMM Parameters ===
     const float alpha = 1.0f;
     const float beta = 0.0f;
+    
     status = cublasSgemmStridedBatched(
         handle,
-        CUBLAS_OP_T,                // Transpose A
-        CUBLAS_OP_T,                // Transpose B
-        m, l, k,                    // Original dimensions
-        &alpha,                     // Scaling factor for AB
-        d_A, n,                     // Matrix A with leading dimension n
-        strideA,
-        d_B, l,                     // Matrix B with leading dimension l
+        CUBLAS_OP_N,                // No transpose for A
+        CUBLAS_OP_N,                // No transpose for B
+        l, m, k,                    // Dimensions swapped for column-major
+        &alpha,
+        d_B, l,                     // Matrix B first
         strideB,
-        &beta,                      // Scaling factor for C
-        d_C, m,                     // Output matrix C
+        d_A, k,                     // Matrix A second
+        strideA,
+        &beta,
+        d_C, m,
         strideC,
         batch_size
     );
+    
+    // 3. Force synchronization after computation
+    cudaDeviceSynchronize();
 
     if (status != CUBLAS_STATUS_SUCCESS) {
         printf("Failed to execute batched GEMM: %d\n", status);
         return 1;
     }
 
+    // 3. Force synchronization after computation
+    cudaDeviceSynchronize();
+    
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
     cudaEventElapsedTime(&tc_time, start, stop);
@@ -561,7 +643,7 @@ int main(int argc, char **argv) {
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tc_time * 1000000000.0));
     printf("   Speedup vs Naive: %.2fx\n", original_time / tc_time);
     printf("   Speedup vs Shared Memory: %.2fx\n", optimized_time / tc_time);
-    
+
     // Check accuracy against naive implementation
     bool cublas_matches = true;
     float cublas_max_diff = 0.0f;
@@ -575,42 +657,34 @@ int main(int argc, char **argv) {
     }
     printf("   Accuracy Check: %s (max diff: %e)\n", 
            cublas_matches ? "PASSED" : "FAILED", cublas_max_diff);
-
-    // === Performance Summary ===
-    printf("\n=== Performance Summary ===\n");
-    printf("1. Naive Implementation:        %.3f ms\n", original_time);
-    printf("2. Shared Memory Implementation: %.3f ms (%.2fx faster than naive)\n", 
-           optimized_time, original_time / optimized_time);
-    printf("3. cuBLAS Implementation:       %.3f ms (%.2fx faster than naive)\n", 
-           tc_time, original_time / tc_time);
-
-    // === Final Summary ===
-    printf("\n=== Accuracy Summary ===\n");
-    printf("Shared Memory vs Naive: %s (max diff: %e)\n", 
-           shared_mem_matches ? "PASSED" : "FAILED", shared_mem_max_diff);
-    printf("cuBLAS vs Naive:       %s (max diff: %e)\n", 
-           cublas_matches ? "PASSED" : "FAILED", cublas_max_diff);
-
-    // === Resource Cleanup ===
-    // 1. Clean up CUDA streams
+    
+    // === Resource Cleanup Strategy ===
+    // CUDA requires explicit cleanup of all allocated resources
+    // Order matters: destroy dependent resources first
+    
+    // 1. Streams: Allow concurrent operations
+    // Must be destroyed after all operations complete
     for (int i = 0; i < NUM_STREAMS; i++) {
         cudaStreamDestroy(streams[i]);
     }
 
-    // 2. Clean up CUDA resources
-    cudaEventDestroy(start);      // Destroy timing events
+    // 2. CUDA Events: Used for performance timing
+    // Can be destroyed after timing is complete
+    cudaEventDestroy(start);
     cudaEventDestroy(stop);
     
-    // 3. Free GPU memory
-    cudaFree(d_A);  // Free device matrix A
-    cudaFree(d_B);  // Free device matrix B
-    cudaFree(d_C);  // Free device matrix C
+    // 3. GPU Memory: Must be explicitly freed
+    // Failure to free GPU memory leads to memory leaks
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
     
-    // 4. Free CPU memory
-    free(h_A);           // Free host matrix A
-    free(h_B);           // Free host matrix B
-    free(h_C);           // Free host matrix C
-    free(h_C_original);  // Free reference results
+    // 4. CPU Memory: Standard C cleanup
+    // Free host memory last
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    free(h_C_original);
 
     return 0;
 } 
