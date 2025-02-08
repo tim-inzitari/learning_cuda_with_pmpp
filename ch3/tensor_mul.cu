@@ -501,29 +501,32 @@ int main(int argc, char** argv) {
     // Performance Summary.
     //------------------------------------------------------------------------------
     printf("\n=== Performance Summary ===\n");
-    printf("Implementation      Time (ms)    GFLOPS    vs Naive    vs CPU\n");
-    printf("----------------------------------------------------------------\n");
-    printf("0. Naive GPU       %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("Tensor Dimensions: [%d × %d × %d] × [%d × %d × %d]\n", 
+           batch_size, m, n, batch_size, k, l);
+    printf("--------------------------------------------------------------------------------\n");
+    printf("Implementation      Time (ms)        GFLOPS    vs Naive        vs CPU\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("0. Naive GPU       %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm0.totalTime, pm0.gflops, 1.0f, cpu_time/pm0.totalTime);
-    printf("1. CPU (OpenMP)    %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("1. CPU (OpenMP)    %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            cpu_time, (2.0f * batch_size * m * n * l) / (cpu_time * 1e6f), 
            pm0.totalTime/cpu_time, 1.0f);
-    printf("2. Shared Memory   %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("2. Shared Memory   %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm2.totalTime, pm2.gflops, pm0.totalTime/pm2.totalTime, 
            cpu_time/pm2.totalTime);
-    printf("3. cuBLAS          %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("3. cuBLAS          %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm3.totalTime, pm3.gflops, pm0.totalTime/pm3.totalTime, 
            cpu_time/pm3.totalTime);
-    printf("4. Vectorized      %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("4. Vectorized      %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm4.totalTime, pm4.gflops, pm0.totalTime/pm4.totalTime, 
            cpu_time/pm4.totalTime);
-    printf("5. Warp-Optimized  %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("5. Warp-Optimized  %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm5.totalTime, pm5.gflops, pm0.totalTime/pm5.totalTime, 
            cpu_time/pm5.totalTime);
-    printf("6. Double-Buffered %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("6. Double-Buffered %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm6.totalTime, pm6.gflops, pm0.totalTime/pm6.totalTime, 
            cpu_time/pm6.totalTime);
-    printf("7. Tensor Core     %8.3f    %7.2f    %6.2fx    %6.2fx\n", 
+    printf("7. Tensor Core     %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
            pm7.totalTime, pm7.gflops, pm0.totalTime/pm7.totalTime, 
            cpu_time/pm7.totalTime);
     
