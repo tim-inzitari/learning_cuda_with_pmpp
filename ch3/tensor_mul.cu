@@ -10,6 +10,8 @@
 #include <cuda_runtime.h>          // Include the CUDA Runtime API header for simplified memory management and kernel launching.
 #include <cublas_v2.h>             // Include the cuBLAS header for GPU-accelerated BLAS routines.
 
+using namespace nvcuda;
+
 //------------------------------------------------------------------------------
 // Define architecture-specific constants and macros for optimization.
 //------------------------------------------------------------------------------
@@ -285,6 +287,69 @@ void tensor_mul_double_buffered(float *A, float *B, float *C, int batch_size, in
 }  // End of tensor_mul_double_buffered kernel.
 
 //------------------------------------------------------------------------------
+// Tensor Core Implementation using WMMA API
+// This kernel leverages Tensor Cores for high-performance matrix multiplication
+// - Uses FP16 (half precision) for input matrices
+// - Outputs in FP32 (single precision)
+// - Operates on 16x16x16 matrix fragments
+//------------------------------------------------------------------------------
+__global__ void tensor_mul_tensorcore(half *A, half *B, float *C, 
+                                    int batch_size, int m, int n, int k, int l) {
+    // WMMA operates on fixed-size 16x16x16 matrices for optimal tensor core utilization
+    const int WMMA_M = 16;  // Height of the matrix multiplication
+    const int WMMA_N = 16;  // Width of the matrix multiplication
+    const int WMMA_K = 16;  // Size of inner dimension
+    
+    // Declare matrix fragments for tensor operations
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, 
+                  wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half,
+                  wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    
+    // Calculate thread and block indices
+    int batch = blockIdx.z;        // Current batch being processed
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;  // Warp's row position
+    int warpN = blockIdx.y * blockDim.y + threadIdx.y;               // Warp's column position
+    
+    // Calculate memory offsets for each batch
+    size_t batch_offset_A = (size_t)batch * m * n;  // Offset for matrix A
+    size_t batch_offset_B = (size_t)batch * k * l;  // Offset for matrix B
+    size_t batch_offset_C = (size_t)batch * m * l;  // Offset for output matrix C
+    
+    // Initialize accumulator fragment to zeros
+    wmma::fill_fragment(c_frag, 0.0f);
+    
+    // Process matrix multiplication in 16x16x16 tiles
+    for (int i = 0; i < n; i += WMMA_K) {
+        // Calculate current tile positions
+        int aRow = warpM * WMMA_M;  // Starting row in matrix A
+        int aCol = i;               // Starting column in matrix A
+        int bRow = i;               // Starting row in matrix B
+        int bCol = warpN * WMMA_N;  // Starting column in matrix B
+        
+        // Check if current tile is within matrix bounds
+        if (aRow < m && aCol < n && bRow < k && bCol < l) {
+            // Load matrix fragments from global memory
+            wmma::load_matrix_sync(a_frag, A + batch_offset_A + aRow * n + aCol, n);
+            wmma::load_matrix_sync(b_frag, B + batch_offset_B + bRow * l + bCol, l);
+            
+            // Perform matrix multiplication on fragments using tensor cores
+            wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+    }
+    
+    // Write results back to global memory
+    int cRow = warpM * WMMA_M;  // Output row position
+    int cCol = warpN * WMMA_N;  // Output column position
+    if (cRow < m && cCol < l) {
+        // Store accumulated results back to global memory
+        wmma::store_matrix_sync(C + batch_offset_C + cRow * l + cCol, c_frag, l, 
+                              wmma::mem_row_major);
+    }
+}
+
+//------------------------------------------------------------------------------
 // Main function demonstrating various tensor multiplication implementations using CUDA.
 //------------------------------------------------------------------------------
 int main(int argc, char **argv) {  // Start of the main function; argc holds argument count, argv holds argument strings.
@@ -310,6 +375,41 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     size_t total_elements_B = batch_size * k * l;    // Calculate the total number of elements in matrix B.
     size_t total_elements_C = batch_size * m * l;    // Calculate the total number of elements in matrix C.
     size_t total_bytes = (total_elements_A + total_elements_B + total_elements_C) * sizeof(float);  // Compute total bytes needed.
+    
+    //------------------------------------------------------------------------------
+    // Display Memory Requirements.
+    //------------------------------------------------------------------------------
+    size_t total_host_memory = (total_elements_A + total_elements_B + total_elements_C * 2) * sizeof(float);
+    printf("\n=== Memory Requirements ===\n");
+    printf("Host Memory Required: %.2f MB\n", total_host_memory / (1024.0 * 1024.0));
+    printf("GPU Memory Required: %.2f MB\n", total_bytes / (1024.0 * 1024.0));
+    
+    // Check tensor core memory requirements
+    size_t tensor_memory = (total_elements_A + total_elements_B) * sizeof(half) 
+                        + total_elements_C * sizeof(float);
+    size_t free_memory, total_memory;
+    cudaMemGetInfo(&free_memory, &total_memory);
+    bool skip_tensor = false;
+    if (tensor_memory > free_memory) {
+        printf("Note: Tensor Core implementation will be skipped (needs %.2f GB, has %.2f GB free)\n",
+               tensor_memory / (1024.0 * 1024.0 * 1024.0),
+               free_memory / (1024.0 * 1024.0 * 1024.0));
+        skip_tensor = true;
+    }
+    
+    if (total_host_memory > 16ULL * 1024 * 1024 * 1024) {  // Check if host memory exceeds 16GB.
+        printf("Warning: Required host memory (%.2f GB) might exceed system memory\n", 
+               total_host_memory / (1024.0 * 1024.0 * 1024.0));  // Print warning.
+        printf("Continue? (y/n): ");  // Ask user if they wish to continue.
+        char response;  // Variable to store user response.
+        if (scanf(" %c", &response) != 1) {  // Read user response.
+            printf("Error reading response\n");  // Print error if reading fails.
+            return 1;  // Exit with error.
+        }
+        if (response != 'y' && response != 'Y') {  // If user does not choose 'y' or 'Y'.
+            return 0;  // Exit the program.
+        }
+    }
     
     //------------------------------------------------------------------------------
     // Grid and Block Configuration for Kernel Launches.
@@ -370,27 +470,6 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     if (batch_size <= 0 || m <= 0 || n <= 0 || k <= 0 || l <= 0) {  // Ensure all dimensions are positive.
         printf("Error: All dimensions must be positive integers\n");  // Print an error if not.
         return 1;  // Exit with an error code.
-    }
-    
-    //------------------------------------------------------------------------------
-    // Display Memory Requirements.
-    //------------------------------------------------------------------------------
-    size_t total_host_memory = (total_elements_A + total_elements_B + total_elements_C * 2) * sizeof(float);  // Calculate total host memory needed (extra copy for baseline).
-    printf("\n=== Memory Requirements ===\n");  // Print header.
-    printf("Host Memory Required: %.2f MB\n", total_host_memory / (1024.0 * 1024.0));  // Print host memory requirement in MB.
-    printf("GPU Memory Required: %.2f MB\n", total_bytes / (1024.0 * 1024.0));  // Print GPU memory requirement in MB.
-    
-    if (total_host_memory > 16ULL * 1024 * 1024 * 1024) {  // Check if host memory exceeds 16GB.
-        printf("Warning: Required host memory (%.2f GB) might exceed system memory\n", total_host_memory / (1024.0 * 1024.0 * 1024.0));  // Print warning.
-        printf("Continue? (y/n): ");  // Ask user if they wish to continue.
-        char response;  // Variable to store user response.
-        if (scanf(" %c", &response) != 1) {  // Read user response.
-            printf("Error reading response\n");  // Print error if reading fails.
-            return 1;  // Exit with error.
-        }
-        if (response != 'y' && response != 'Y') {  // If user does not choose 'y' or 'Y'.
-            return 0;  // Exit the program.
-        }
     }
     
     //------------------------------------------------------------------------------
@@ -494,6 +573,7 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     float vec_transfer_time = 0.0f, vec_result_time = 0.0f;
     float warp_transfer_time = 0.0f, warp_result_time = 0.0f;
     float buf_transfer_time = 0.0f, buf_result_time = 0.0f;
+    float tensor_time = 0.0f, tensor_transfer_time = 0.0f, tensor_result_time = 0.0f;
     
     cudaEventCreate(&start);  // Create the start event.
     cudaEventCreate(&stop);   // Create the stop event.
@@ -752,9 +832,9 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
         if (diff > 1e-5) {  // Check if difference exceeds tolerance
             warp_matches = false;  // Mark as inaccurate
             break;  // Exit loop
+            }
         }
-    }
-    printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n", 
+        printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n",
            warp_matches ? "PASSED" : "FAILED", warp_max_diff);  // Print accuracy result
     
     //------------------------------------------------------------------------------
@@ -809,6 +889,94 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     printf("   Accuracy Check: %s (Max Diff: %e)\n", buffered_matches ? "PASSED" : "FAILED", buffered_max_diff);  // Print accuracy result.
     
     //------------------------------------------------------------------------------
+    // Test 7: Tensor Core Implementation
+    //------------------------------------------------------------------------------
+    printf("\n7. Tensor Core Implementation:\n");
+    
+    if (skip_tensor) {
+        printf("   Skipped: Insufficient GPU memory\n");
+    } else if (m % 16 != 0 || n % 16 != 0 || l % 16 != 0) {
+        printf("   Skipped: Matrix dimensions must be multiples of 16\n");
+    } else {
+        // Allocate and convert matrices to half precision for tensor core operations
+        half *d_A_half, *d_B_half;
+        cudaMalloc(&d_A_half, total_elements_A * sizeof(half));
+        cudaMalloc(&d_B_half, total_elements_B * sizeof(half));
+
+        // Allocate host memory and convert input matrices to half precision
+        half *h_A_half = (half*)malloc(total_elements_A * sizeof(half));
+        half *h_B_half = (half*)malloc(total_elements_B * sizeof(half));
+        for (size_t i = 0; i < total_elements_A; i++) {
+            h_A_half[i] = __float2half(h_A[i]);
+        }
+        for (size_t i = 0; i < total_elements_B; i++) {
+            h_B_half[i] = __float2half(h_B[i]);
+        }
+
+        // Time host to device (H2D) transfer of half-precision matrices
+    cudaEventRecord(start);
+        cudaMemcpy(d_A_half, h_A_half, total_elements_A * sizeof(half), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_B_half, h_B_half, total_elements_B * sizeof(half), cudaMemcpyHostToDevice);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&tensor_transfer_time, start, stop);
+
+        // Configure grid and block dimensions for tensor core kernel
+        dim3 tensorBlock(256, 1, 1);
+        dim3 tensorGrid(
+            (m + 15) / 16,  // Ceil(m/16) blocks for rows
+            (l + 15) / 16,  // Ceil(l/16) blocks for columns
+            batch_size      // One block per batch
+        );
+
+        // Time the tensor core kernel execution
+        cudaEventRecord(start);
+        tensor_mul_tensorcore<<<tensorGrid, tensorBlock>>>(
+            d_A_half, d_B_half, d_C, batch_size, m, n, k, l);
+        cudaEventRecord(stop);
+        cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&tensor_time, start, stop);
+
+        // Time device to host (D2H) transfer of results
+    cudaEventRecord(start);
+        cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+        cudaEventElapsedTime(&tensor_result_time, start, stop);
+
+        // Clean up tensor core specific resources
+        cudaFree(d_A_half);
+        cudaFree(d_B_half);
+        free(h_A_half);
+        free(h_B_half);
+
+        // Check accuracy against baseline implementation
+        bool tensor_matches = true;
+        float tensor_max_diff = 0.0f;
+    for (size_t i = 0; i < total_elements_C; i++) {
+        float diff = fabs(h_C[i] - h_C_original[i]);
+            tensor_max_diff = max(tensor_max_diff, diff);
+        if (diff > 1e-5) {
+                tensor_matches = false;
+            break;
+        }
+    }
+        printf("   Memory Transfer (H2D): %.3f ms\n", tensor_transfer_time);
+        printf("   Computation Time: %.3f ms\n", tensor_time);
+        printf("   Memory Transfer (D2H): %.3f ms\n", tensor_result_time);
+        printf("   Total Time: %.3f ms\n", tensor_transfer_time + tensor_time + tensor_result_time);
+        printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tensor_time * 1000000000.0));
+        printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / tensor_time);
+        printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / tensor_time);
+        printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / tensor_time);
+        printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / tensor_time);
+        printf("   Speedup vs Test 5 (Warp-Optimized): %.2fx\n", warp_time / tensor_time);
+        printf("   Speedup vs Test 6 (Double-Buffered): %.2fx\n", buffered_time / tensor_time);
+    printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n",
+               tensor_matches ? "PASSED" : "FAILED", tensor_max_diff);
+    }
+
+    //------------------------------------------------------------------------------
     // Final Performance Summary.
     //------------------------------------------------------------------------------
     printf("\n=== Performance Summary ===\n");  // Print summary header.
@@ -833,6 +1001,17 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     
     printf("6. Double-Buffered Implementation:\n");  // Print label.
     printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n", buffered_time, buf_transfer_time, buf_result_time, buf_transfer_time + buffered_time + buf_result_time);  // Print metrics.
+    
+    printf("7. Tensor Core Implementation:\n");  // Print label.
+    if (skip_tensor) {
+        printf("   Skipped: Insufficient GPU memory\n");
+    } else if (m % 16 != 0 || n % 16 != 0 || l % 16 != 0) {
+        printf("   Skipped: Matrix dimensions must be multiples of 16\n");
+    } else {
+        printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n", 
+               tensor_time, tensor_transfer_time, tensor_result_time, 
+               tensor_transfer_time + tensor_time + tensor_result_time);
+    }
     
     //------------------------------------------------------------------------------
     // Resource Cleanup.
