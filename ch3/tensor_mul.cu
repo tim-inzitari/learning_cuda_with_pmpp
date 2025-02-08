@@ -1,3 +1,6 @@
+
+// compile with:nvcc -O3 -arch=sm_86 -std=c++20 --use_fast_math -Xcompiler "-fopenmp -fPIC -pthread -march=native" tensor_mul.cu -o tensor_mul -lcublas
+
 //------------------------------------------------------------------------------
 // Refactored tensor_mul.cu
 //------------------------------------------------------------------------------
