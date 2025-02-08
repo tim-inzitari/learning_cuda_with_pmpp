@@ -893,87 +893,89 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     //------------------------------------------------------------------------------
     printf("\n7. Tensor Core Implementation:\n");
     
-    if (skip_tensor) {
-        printf("   Skipped: Insufficient GPU memory\n");
-    } else if (m % 16 != 0 || n % 16 != 0 || l % 16 != 0) {
-        printf("   Skipped: Matrix dimensions must be multiples of 16\n");
-    } else {
-        // Allocate and convert matrices to half precision for tensor core operations
-        half *d_A_half, *d_B_half;
-        cudaMalloc(&d_A_half, total_elements_A * sizeof(half));
-        cudaMalloc(&d_B_half, total_elements_B * sizeof(half));
+    if (skip_tensor) {  // Check if we need to skip tensor core implementation due to memory constraints
+        printf("   Skipped: Insufficient GPU memory\n");  // Print skip message for memory limitation
+    } else if (m % 16 != 0 || n % 16 != 0 || l % 16 != 0) {  // Check if dimensions are multiples of 16 (tensor core requirement)
+        printf("   Skipped: Matrix dimensions must be multiples of 16\n");  // Print skip message for dimension mismatch
+    } else {  // If all requirements are met, proceed with tensor core implementation
+        // Allocate device memory for half-precision matrices
+        half *d_A_half, *d_B_half;  // Declare device pointers for half-precision matrices
+        cudaMalloc(&d_A_half, total_elements_A * sizeof(half));  // Allocate device memory for matrix A in half precision
+        cudaMalloc(&d_B_half, total_elements_B * sizeof(half));  // Allocate device memory for matrix B in half precision
 
-        // Allocate host memory and convert input matrices to half precision
-        half *h_A_half = (half*)malloc(total_elements_A * sizeof(half));
-        half *h_B_half = (half*)malloc(total_elements_B * sizeof(half));
-        for (size_t i = 0; i < total_elements_A; i++) {
-            h_A_half[i] = __float2half(h_A[i]);
+        // Allocate and prepare host memory for half-precision matrices
+        half *h_A_half = (half*)malloc(total_elements_A * sizeof(half));  // Allocate host memory for half-precision A
+        half *h_B_half = (half*)malloc(total_elements_B * sizeof(half));  // Allocate host memory for half-precision B
+        for (size_t i = 0; i < total_elements_A; i++) {  // Convert matrix A elements to half precision
+            h_A_half[i] = __float2half(h_A[i]);  // Convert each element from float to half
         }
-        for (size_t i = 0; i < total_elements_B; i++) {
-            h_B_half[i] = __float2half(h_B[i]);
+        for (size_t i = 0; i < total_elements_B; i++) {  // Convert matrix B elements to half precision
+            h_B_half[i] = __float2half(h_B[i]);  // Convert each element from float to half
         }
 
-        // Time host to device (H2D) transfer of half-precision matrices
-    cudaEventRecord(start);
-        cudaMemcpy(d_A_half, h_A_half, total_elements_A * sizeof(half), cudaMemcpyHostToDevice);
-        cudaMemcpy(d_B_half, h_B_half, total_elements_B * sizeof(half), cudaMemcpyHostToDevice);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&tensor_transfer_time, start, stop);
+        // Time host to device transfer
+        cudaEventRecord(start);  // Start timing H2D transfer
+        cudaMemcpy(d_A_half, h_A_half, total_elements_A * sizeof(half), cudaMemcpyHostToDevice);  // Copy A to device
+        cudaMemcpy(d_B_half, h_B_half, total_elements_B * sizeof(half), cudaMemcpyHostToDevice);  // Copy B to device
+        cudaEventRecord(stop);  // Stop timing H2D transfer
+        cudaEventSynchronize(stop);  // Wait for transfer to complete
+        cudaEventElapsedTime(&tensor_transfer_time, start, stop);  // Calculate H2D transfer time
 
-        // Configure grid and block dimensions for tensor core kernel
-        dim3 tensorBlock(256, 1, 1);
-        dim3 tensorGrid(
-            (m + 15) / 16,  // Ceil(m/16) blocks for rows
-            (l + 15) / 16,  // Ceil(l/16) blocks for columns
+        // Configure kernel launch parameters
+        dim3 tensorBlock(256, 1, 1);  // Define block dimensions for tensor core kernel
+        dim3 tensorGrid(  // Define grid dimensions for tensor core kernel
+            (m + 15) / 16,  // Calculate number of blocks for rows (ceiling division by 16)
+            (l + 15) / 16,  // Calculate number of blocks for columns (ceiling division by 16)
             batch_size      // One block per batch
         );
 
-        // Time the tensor core kernel execution
-        cudaEventRecord(start);
-        tensor_mul_tensorcore<<<tensorGrid, tensorBlock>>>(
-            d_A_half, d_B_half, d_C, batch_size, m, n, k, l);
-        cudaEventRecord(stop);
-        cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&tensor_time, start, stop);
+        // Time kernel execution
+        cudaEventRecord(start);  // Start timing kernel execution
+        tensor_mul_tensorcore<<<tensorGrid, tensorBlock>>>(  // Launch tensor core kernel
+            d_A_half, d_B_half, d_C, batch_size, m, n, k, l);  // Pass parameters to kernel
+        cudaEventRecord(stop);  // Stop timing kernel execution
+        cudaEventSynchronize(stop);  // Wait for kernel to complete
+        cudaEventElapsedTime(&tensor_time, start, stop);  // Calculate kernel execution time
 
-        // Time device to host (D2H) transfer of results
-    cudaEventRecord(start);
-        cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);
-    cudaEventRecord(stop);
-    cudaEventSynchronize(stop);
-        cudaEventElapsedTime(&tensor_result_time, start, stop);
+        // Time device to host transfer
+        cudaEventRecord(start);  // Start timing D2H transfer
+        cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);  // Copy result back to host
+        cudaEventRecord(stop);  // Stop timing D2H transfer
+        cudaEventSynchronize(stop);  // Wait for transfer to complete
+        cudaEventElapsedTime(&tensor_result_time, start, stop);  // Calculate D2H transfer time
 
-        // Clean up tensor core specific resources
-        cudaFree(d_A_half);
-        cudaFree(d_B_half);
-        free(h_A_half);
-        free(h_B_half);
+        // Clean up resources
+        cudaFree(d_A_half);  // Free device memory for half-precision A
+        cudaFree(d_B_half);  // Free device memory for half-precision B
+        free(h_A_half);      // Free host memory for half-precision A
+        free(h_B_half);      // Free host memory for half-precision B
 
-        // Check accuracy against baseline implementation
-        bool tensor_matches = true;
-        float tensor_max_diff = 0.0f;
-    for (size_t i = 0; i < total_elements_C; i++) {
-        float diff = fabs(h_C[i] - h_C_original[i]);
-            tensor_max_diff = max(tensor_max_diff, diff);
-        if (diff > 1e-5) {
-                tensor_matches = false;
-            break;
+        // Verify results
+        bool tensor_matches = true;  // Initialize accuracy check flag
+        float tensor_max_diff = 0.0f;  // Initialize maximum difference tracker
+        for (size_t i = 0; i < total_elements_C; i++) {  // Check each element
+            float diff = fabs(h_C[i] - h_C_original[i]);  // Calculate absolute difference
+            tensor_max_diff = max(tensor_max_diff, diff);  // Update maximum difference
+            if (diff > 1e-5) {  // Check if difference exceeds tolerance
+                tensor_matches = false;  // Mark as failed if tolerance exceeded
+                break;  // Exit loop on first failure
+            }
         }
-    }
-        printf("   Memory Transfer (H2D): %.3f ms\n", tensor_transfer_time);
-        printf("   Computation Time: %.3f ms\n", tensor_time);
-        printf("   Memory Transfer (D2H): %.3f ms\n", tensor_result_time);
-        printf("   Total Time: %.3f ms\n", tensor_transfer_time + tensor_time + tensor_result_time);
-        printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tensor_time * 1000000000.0));
-        printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / tensor_time);
-        printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / tensor_time);
-        printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / tensor_time);
-        printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / tensor_time);
-        printf("   Speedup vs Test 5 (Warp-Optimized): %.2fx\n", warp_time / tensor_time);
-        printf("   Speedup vs Test 6 (Double-Buffered): %.2fx\n", buffered_time / tensor_time);
-    printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n",
-               tensor_matches ? "PASSED" : "FAILED", tensor_max_diff);
+
+        // Print performance metrics
+        printf("   Memory Transfer (H2D): %.3f ms\n", tensor_transfer_time);  // Print H2D transfer time
+        printf("   Computation Time: %.3f ms\n", tensor_time);  // Print computation time
+        printf("   Memory Transfer (D2H): %.3f ms\n", tensor_result_time);  // Print D2H transfer time
+        printf("   Total Time: %.3f ms\n", tensor_transfer_time + tensor_time + tensor_result_time);  // Print total time
+        printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tensor_time * 1000000000.0));  // Print TFLOPS
+        printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / tensor_time);  // Print speedup vs naive
+        printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / tensor_time);  // Print speedup vs shared
+        printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / tensor_time);  // Print speedup vs cuBLAS
+        printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / tensor_time);  // Print speedup vs vectorized
+        printf("   Speedup vs Test 5 (Warp-Optimized): %.2fx\n", warp_time / tensor_time);  // Print speedup vs warp
+        printf("   Speedup vs Test 6 (Double-Buffered): %.2fx\n", buffered_time / tensor_time);  // Print speedup vs buffered
+        printf("   Accuracy Check (vs Baseline): %s (max diff: %e)\n",  // Print accuracy check results
+               tensor_matches ? "PASSED" : "FAILED", tensor_max_diff);  // Show pass/fail and maximum difference
     }
 
     //------------------------------------------------------------------------------
