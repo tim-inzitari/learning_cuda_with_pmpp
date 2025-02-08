@@ -327,6 +327,11 @@ PerfMetrics runTestTensorCore(const float* h_A, const float* h_B, float* h_C,
     
     size_t totalA = batch_size * m * n;
     size_t totalB = batch_size * k * l;
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float elapsed;
+
     // Allocate host memory for half-precision arrays.
     half* h_A_half = (half*)malloc(totalA * sizeof(half));
     half* h_B_half = (half*)malloc(totalB * sizeof(half));
@@ -341,8 +346,15 @@ PerfMetrics runTestTensorCore(const float* h_A, const float* h_B, float* h_C,
     half *d_A_half, *d_B_half;
     cudaMalloc((void**)&d_A_half, totalA * sizeof(half));
     cudaMalloc((void**)&d_B_half, totalB * sizeof(half));
+    
+    // Time H2D transfers
+    cudaEventRecord(start);
     cudaMemcpy(d_A_half, h_A_half, totalA * sizeof(half), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B_half, h_B_half, totalB * sizeof(half), cudaMemcpyHostToDevice);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed, start, stop);
+    pm.transferTime = elapsed;
     
     // Allocate device memory for result (reuse d_C allocated in runGpuTest pattern).
     float* d_C;
@@ -351,10 +363,6 @@ PerfMetrics runTestTensorCore(const float* h_A, const float* h_B, float* h_C,
     // Launch Tensor Core kernel.
     dim3 block(16, 16, 1);
     dim3 grid((m + 15) / 16, (l + 15) / 16, batch_size);
-    float elapsed;
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
     
     cudaEventRecord(start);
     tensor_mul_tensorcore<<<grid, block>>>(d_A_half, d_B_half, d_C, batch_size, m, n, k, l);
@@ -363,12 +371,20 @@ PerfMetrics runTestTensorCore(const float* h_A, const float* h_B, float* h_C,
     cudaEventElapsedTime(&elapsed, start, stop);
     pm.kernelTime = elapsed;
     
-    // Copy result back to host.
+    // Time D2H transfer
+    cudaEventRecord(start);
     cudaMemcpy(h_C, d_C, batch_size * m * l * sizeof(float), cudaMemcpyDeviceToHost);
-    pm.totalTime = pm.kernelTime;  // For simplicity, not timing transfers here.
-    pm.transferTime = 0;
-    pm.d2hTime = 0;
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed, start, stop);
+    pm.d2hTime = elapsed;
+    
+    pm.totalTime = pm.transferTime + pm.kernelTime + pm.d2hTime;
     pm.gflops = (2.0f * batch_size * m * n * l) / (pm.kernelTime * 1e6f);
+    
+    printf("Test 7: Tensor Core Implementation:\n");
+    printf("   H2D: %.3f ms, Kernel: %.3f ms, D2H: %.3f ms, Total: %.3f ms, GFLOPS: %.2f\n",
+           pm.transferTime, pm.kernelTime, pm.d2hTime, pm.totalTime, pm.gflops);
     
     free(h_A_half);
     free(h_B_half);
@@ -419,6 +435,7 @@ int main(int argc, char** argv) {
     
     // Test 0: Naive GPU Implementation (baseline)
     PerfMetrics pm0 = runTestNaive(h_A, h_B, h_C_baseline, batch_size, m, n, k, l);
+    printf("\n");
     
     // Test 1: CPU Implementation using OpenMP.
     double t_cpu_start = clock();
@@ -431,36 +448,43 @@ int main(int argc, char** argv) {
         printf("   Accuracy Check: PASSED (max diff: %e)\n", max_diff_cpu);
     else
         printf("   Accuracy Check: FAILED (max diff: %e)\n", max_diff_cpu);
+    printf("\n");
     
     // Test 2: Shared Memory Implementation.
     PerfMetrics pm2 = runTestSharedMemory(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     float diff2 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
     printf("Test 2: Shared Memory Implementation: Accuracy (max diff: %e)\n", diff2);
+    printf("\n");
     
     // Test 3: cuBLAS Implementation.
     PerfMetrics pm3 = runTestCublas(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     float diff3 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
     printf("Test 3: cuBLAS Implementation: Accuracy (max diff: %e)\n", diff3);
+    printf("\n");
     
     // Test 4: Vectorized Implementation.
     PerfMetrics pm4 = runTestVectorized(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     float diff4 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
     printf("Test 4: Vectorized Implementation: Accuracy (max diff: %e)\n", diff4);
+    printf("\n");
     
     // Test 5: Warp-Optimized Implementation.
     PerfMetrics pm5 = runTestWarpOptimized(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     float diff5 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
     printf("Test 5: Warp-Optimized Implementation: Accuracy (max diff: %e)\n", diff5);
+    printf("\n");
     
     // Test 6: Double-Buffered Implementation.
     PerfMetrics pm6 = runTestDoubleBuffered(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     float diff6 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
     printf("Test 6: Double-Buffered Implementation: Accuracy (max diff: %e)\n", diff6);
+    printf("\n");
     
     // Test 7: Tensor Core Implementation.
     PerfMetrics pm7 = runTestTensorCore(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     float diff7 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 2e-2f);
     printf("Test 7: Tensor Core Implementation: Accuracy (max diff: %e)\n", diff7);
+    printf("\n");
     
     //------------------------------------------------------------------------------    
     // Performance Summary.
