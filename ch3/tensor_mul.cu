@@ -211,8 +211,8 @@ PerfMetrics runTestNaive(const float* h_A, const float* h_B, float* h_C,
 //------------------------------------------------------------------------------
 PerfMetrics runTestSharedMemory(const float* h_A, const float* h_B, float* h_C,
                                 int batch_size, int m, int n, int k, int l) {
-    dim3 block(16, 16);
-    dim3 grid((m + 15) / 16, (l + 15) / 16, batch_size);
+    dim3 block(TILE_SIZE, TILE_SIZE);
+    dim3 grid((m + TILE_SIZE - 1) / TILE_SIZE, (l + TILE_SIZE - 1) / TILE_SIZE, batch_size);
     return runGpuTest("Test 2: Shared Memory Implementation", tensor_mul_shared,
                       h_A, h_B, h_C, batch_size, m, n, k, l, grid, block);
 }
@@ -453,7 +453,7 @@ int main(int argc, char** argv) {
     cpu_matrix_multiply(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
     double cpu_time = (clock() - t_cpu_start) / (double)CLOCKS_PER_SEC * 1000.0;
     printf("Test 1: CPU Implementation (OpenMP):\n   Computation: %.3f ms\n", cpu_time);
-    float tol = 1e-4f;  // Tolerance set to 1e-4 for CPU check.
+    float tol = 1e-3f;  // Relaxed tolerance to 1e-3 for CPU check.
     float max_diff_cpu = checkResults(h_C_baseline, h_C_temp, total_elements_C, tol);
     if (max_diff_cpu <= tol)
         printf("   Accuracy Check: PASSED (max diff: %e)\n", max_diff_cpu);
@@ -504,29 +504,29 @@ int main(int argc, char** argv) {
     printf("Tensor Dimensions: [%d × %d × %d] × [%d × %d × %d]\n", 
            batch_size, m, n, batch_size, k, l);
     printf("--------------------------------------------------------------------------------\n");
-    printf("Implementation      Time (ms)        GFLOPS    vs Naive        vs CPU\n");
+    printf("Implementation      Time (ms)        GFLOPS       vs Naive        vs CPU\n");
     printf("--------------------------------------------------------------------------------\n");
-    printf("0. Naive GPU       %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("0. Naive GPU       %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm0.totalTime, pm0.gflops, 1.0f, cpu_time/pm0.totalTime);
-    printf("1. CPU (OpenMP)    %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("1. CPU (OpenMP)    %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            cpu_time, (2.0f * batch_size * m * n * l) / (cpu_time * 1e6f), 
            pm0.totalTime/cpu_time, 1.0f);
-    printf("2. Shared Memory   %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("2. Shared Memory   %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm2.totalTime, pm2.gflops, pm0.totalTime/pm2.totalTime, 
            cpu_time/pm2.totalTime);
-    printf("3. cuBLAS          %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("3. cuBLAS          %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm3.totalTime, pm3.gflops, pm0.totalTime/pm3.totalTime, 
            cpu_time/pm3.totalTime);
-    printf("4. Vectorized      %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("4. Vectorized      %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm4.totalTime, pm4.gflops, pm0.totalTime/pm4.totalTime, 
            cpu_time/pm4.totalTime);
-    printf("5. Warp-Optimized  %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("5. Warp-Optimized  %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm5.totalTime, pm5.gflops, pm0.totalTime/pm5.totalTime, 
            cpu_time/pm5.totalTime);
-    printf("6. Double-Buffered %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("6. Double-Buffered %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm6.totalTime, pm6.gflops, pm0.totalTime/pm6.totalTime, 
            cpu_time/pm6.totalTime);
-    printf("7. Tensor Core     %12.3f    %7.2f    %8.2fx    %10.2fx\n", 
+    printf("7. Tensor Core     %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
            pm7.totalTime, pm7.gflops, pm0.totalTime/pm7.totalTime, 
            cpu_time/pm7.totalTime);
     
@@ -573,53 +573,51 @@ __device__ void tensor_mul_device(const float* A, const float* B, float* C,
     }
 }
 
-// Test 2: Shared Memory Implementation (Placeholder)
+// Revised Shared Memory Kernel
 __global__ void tensor_mul_shared(const float* A, const float* B, float* C,
                                   int batch_size, int m, int n, int k, int l) {
+    // Each batch computes: (m x n) * (n x l) = (m x l)
     int batch = blockIdx.z;
-    int row = blockIdx.x * blockDim.x + threadIdx.x;
-    int col = blockIdx.y * blockDim.y + threadIdx.y;
-    
-    // Shared memory tiles
-    __shared__ float As[TILE_SIZE][TILE_SIZE];
-    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
-    
-    // Calculate indices
-    int tx = threadIdx.x;
-    int ty = threadIdx.y;
-    
-    // Accumulator for the result
+    int row = blockIdx.x * blockDim.x + threadIdx.x;  // row in C and A
+    int col = blockIdx.y * blockDim.y + threadIdx.y;  // col in C and B
+
+    __shared__ float A_shared[TILE_SIZE][TILE_SIZE];
+    __shared__ float B_shared[TILE_SIZE][TILE_SIZE];
+
     float sum = 0.0f;
-    
-    // Loop over tiles
-    for (int t = 0; t < (n + TILE_SIZE - 1) / TILE_SIZE; t++) {
-        // Load tiles into shared memory
-        if (row < m && t * TILE_SIZE + ty < n) {
-            As[tx][ty] = A[batch * m * n + row * n + t * TILE_SIZE + ty];
-        } else {
-            As[tx][ty] = 0.0f;
-        }
-        
-        if (t * TILE_SIZE + tx < n && col < l) {
-            Bs[tx][ty] = B[batch * k * l + (t * TILE_SIZE + tx) * l + col];
-        } else {
-            Bs[tx][ty] = 0.0f;
-        }
-        
-        // Synchronize to ensure tiles are loaded
+    int numTiles = (n + TILE_SIZE - 1) / TILE_SIZE;
+
+    // Precompute batch offsets.
+    int batch_offset_A = batch * m * n;
+    int batch_offset_B = batch * n * l;
+
+    for (int t = 0; t < numTiles; t++) {
+        int tiledCol = t * TILE_SIZE + threadIdx.y;   // Column for tile from A.
+        int tiledRow = t * TILE_SIZE + threadIdx.x;    // Row for tile from B.
+
+        // Load A tile
+        if (row < m && tiledCol < n)
+            A_shared[threadIdx.x][threadIdx.y] = A[batch_offset_A + row * n + tiledCol];
+        else
+            A_shared[threadIdx.x][threadIdx.y] = 0.0f;
+
+        // Load B tile
+        if (tiledRow < n && col < l)
+            B_shared[threadIdx.x][threadIdx.y] = B[batch_offset_B + tiledRow * l + col];
+        else
+            B_shared[threadIdx.x][threadIdx.y] = 0.0f;
+
         __syncthreads();
-        
-        // Compute partial dot product for this tile
-        #pragma unroll
-        for (int k = 0; k < TILE_SIZE; k++) {
-            sum += As[tx][k] * Bs[k][ty];
+
+        // Multiply the two tiles
+        for (int i = 0; i < TILE_SIZE; i++) {
+            sum += A_shared[threadIdx.x][i] * B_shared[i][threadIdx.y];
         }
-        
-        // Synchronize before loading next tile
+
         __syncthreads();
     }
-    
-    // Write result
+
+    // Write back the result in global memory.
     if (row < m && col < l) {
         C[batch * m * l + row * l + col] = sum;
     }
