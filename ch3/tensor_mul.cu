@@ -1,4 +1,8 @@
 //------------------------------------------------------------------------------
+// Compile with:
+// nvcc -O3 -arch=sm_86 --use_fast_math -Xcompiler "-fopenmp -fPIC -pthread -march=native" tensor_mul.cu -o tensor_mul -lcublas
+//------------------------------------------------------------------------------
+//------------------------------------------------------------------------------
 // Include standard C and CUDA headers with detailed explanations.
 //------------------------------------------------------------------------------
 #include <stdio.h>                 // Include the standard I/O library for functions like printf() and scanf().
@@ -9,6 +13,7 @@
 #include <mma.h>                   // Include the header for matrix multiply-accumulate (MMA) operations (used with Tensor Cores).
 #include <cuda_runtime.h>          // Include the CUDA Runtime API header for simplified memory management and kernel launching.
 #include <cublas_v2.h>             // Include the cuBLAS header for GPU-accelerated BLAS routines.
+#include <omp.h>                   // Include OpenMP for CPU parallelization
 
 using namespace nvcuda;
 
@@ -350,6 +355,59 @@ __global__ void tensor_mul_tensorcore(half *A, half *B, float *C,
 }
 
 //------------------------------------------------------------------------------
+// Pthread CPU Implementation Definitions
+//------------------------------------------------------------------------------
+#ifndef MIN
+#define MIN(a,b) ((a) < (b) ? (a) : (b))
+#endif
+
+// CPU Implementation using OpenMP and cache blocking
+#define BLOCK_SIZE_M 32
+#define BLOCK_SIZE_N 32
+#define BLOCK_SIZE_K 32
+#define BLOCK_SIZE_L 32
+
+void cpu_matrix_multiply(float* A, float* B, float* C, int batch_size, int m, int n, int k, int l) {
+    // Initialize output array to zero
+    memset(C, 0, batch_size * m * l * sizeof(float));
+
+    #pragma omp parallel for collapse(4)
+    for (int b = 0; b < batch_size; b++) {
+        for (int i0 = 0; i0 < m; i0 += BLOCK_SIZE_M) {
+            for (int j0 = 0; j0 < l; j0 += BLOCK_SIZE_L) {
+                for (int p0 = 0; p0 < n; p0 += BLOCK_SIZE_N) {
+                    // Block boundaries
+                    int imax = min(i0 + BLOCK_SIZE_M, m);
+                    int jmax = min(j0 + BLOCK_SIZE_L, l);
+                    int pmax = min(p0 + BLOCK_SIZE_N, n);
+                    
+                    // Compute on blocks
+                    for (int i = i0; i < imax; i++) {
+                        for (int j = j0; j < jmax; j++) {
+                            // Compute partial sums with extended precision
+                            __float128 sum = 0.0Q;  // Quad precision for maximum accuracy
+                            size_t base_a = (size_t)b * m * n + (size_t)i * n;
+                            size_t base_b = (size_t)b * k * l + (size_t)j;
+
+                            for (int p = p0; p < pmax; p++) {
+                                __float128 a_val = A[base_a + p];
+                                __float128 b_val = B[base_b + p * l];
+                                sum += a_val * b_val;
+                            }
+                            
+                            // Accumulate partial sum into final result
+                            size_t idx = (size_t)b * m * l + (size_t)i * l + j;
+                            #pragma omp atomic
+                            C[idx] += (float)sum;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+//------------------------------------------------------------------------------
 // Main function demonstrating various tensor multiplication implementations using CUDA.
 //------------------------------------------------------------------------------
 int main(int argc, char **argv) {  // Start of the main function; argc holds argument count, argv holds argument strings.
@@ -451,15 +509,15 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     //------------------------------------------------------------------------------
     // Matrix Initialization.
     //------------------------------------------------------------------------------
-    for (int b = 0; b < batch_size; b++) {  // Loop over each batch.
-        for (int i = 0; i < m; i++) {       // Loop over each row in matrix A.
-            for (int j = 0; j < n; j++) {   // Loop over each column in matrix A.
-                h_A[b * m * n + i * n + j] = (float)(rand() % 100) / 100.0f;  // Assign a random float (0 to 1) to matrix A.
+    for (int b = 0; b < batch_size; b++) {
+        for (int i = 0; i < m; i++) {
+            for (int j = 0; j < n; j++) {
+                h_A[b * m * n + i * n + j] = (float)(rand() % 100) / 100.0f;
             }
         }
-        for (int i = 0; i < k; i++) {       // Loop over each row in matrix B.
-            for (int j = 0; j < l; j++) {   // Loop over each column in matrix B.
-                h_B[b * k * l + i * l + j] = (float)(rand() % 100) / 100.0f;  // Assign a random float (0 to 1) to matrix B.
+        for (int i = 0; i < k; i++) {
+            for (int j = 0; j < l; j++) {
+                h_B[b * k * l + i * l + j] = (float)(rand() % 100) / 100.0f;
             }
         }
     }
@@ -564,9 +622,14 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     printf("----------------------------------------\n");  // Print a separator.
     
     //------------------------------------------------------------------------------
-    // Test 1: Naive Implementation.
+    // Initialize timing variables and CUDA events
     //------------------------------------------------------------------------------
     cudaEvent_t start, stop;  // Declare CUDA events for timing.
+    cudaEventCreate(&start);  // Create the start event.
+    cudaEventCreate(&stop);   // Create the stop event.
+    
+    float transfer_time;     // Declare variables for timing
+    float result_time;
     float original_time = 0.0f, optimized_time = 0.0f;
     float tc_time = 0.0f, vectorized_time = 0.0f;
     float warp_time = 0.0f, buffered_time = 0.0f;
@@ -574,18 +637,19 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     float warp_transfer_time = 0.0f, warp_result_time = 0.0f;
     float buf_transfer_time = 0.0f, buf_result_time = 0.0f;
     float tensor_time = 0.0f, tensor_transfer_time = 0.0f, tensor_result_time = 0.0f;
+    double cpu_time = 0.0;  // Add CPU timing variable
     
-    cudaEventCreate(&start);  // Create the start event.
-    cudaEventCreate(&stop);   // Create the stop event.
-    
+    //------------------------------------------------------------------------------
+    // Test 0: Naive Implementation.
+    //------------------------------------------------------------------------------
+    printf("\n0. Naive Implementation:\n");  // Print test header.
+    // Time the host-to-device (H2D) memory transfer operations
     cudaEventRecord(start);  // Record the start time for H2D transfer.
     cudaMemcpy(d_A, h_A, total_elements_A * sizeof(float), cudaMemcpyHostToDevice);  // Copy matrix A to device.
     cudaMemcpy(d_B, h_B, total_elements_B * sizeof(float), cudaMemcpyHostToDevice);  // Copy matrix B to device.
     cudaEventRecord(stop);   // Record the stop time.
     cudaEventSynchronize(stop);  // Wait for the event to complete.
-    float transfer_time;     // Declare a variable for transfer time.
     cudaEventElapsedTime(&transfer_time, start, stop);  // Compute elapsed time.
-    printf("\n1. Naive Implementation:\n");  // Print test header.
     printf("   Memory Transfer (H2D): %.3f ms\n", transfer_time);  // Print H2D transfer time.
     
     cudaEventRecord(start);  // Record start time for kernel execution.
@@ -599,13 +663,53 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     cudaMemcpy(h_C, d_C, total_elements_C * sizeof(float), cudaMemcpyDeviceToHost);  // Copy result matrix C back to host.
     cudaEventRecord(stop);   // Record stop time.
     cudaEventSynchronize(stop);  // Synchronize events.
-    float result_time;       // Declare variable for result transfer time.
     cudaEventElapsedTime(&result_time, start, stop);  // Compute elapsed time for D2H transfer.
     printf("   Memory Transfer (D2H): %.3f ms\n", result_time);  // Print D2H transfer time.
     printf("   Total Time: %.3f ms\n", transfer_time + original_time + result_time);  // Print total time.
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (original_time * 1000000000.0));  // Compute and print TFLOPS.
     
-    memcpy(h_C_original, h_C, total_elements_C * sizeof(float));  // Save baseline result for accuracy checking.
+    // Save the baseline GPU result for correctness checks.
+    memcpy(h_C_original, h_C, total_elements_C * sizeof(float));
+    
+    //------------------------------------------------------------------------------
+    // Test 1: CPU Implementation (OpenMP)
+    //------------------------------------------------------------------------------
+    printf("\n1. CPU Implementation (OpenMP):\n");
+
+    // Allocate memory for CPU result
+    float *h_C_cpu = (float *)malloc(total_elements_C * sizeof(float));
+    memset(h_C_cpu, 0, total_elements_C * sizeof(float));  // Initialize to zero
+ 
+    // Time CPU implementation
+    clock_t cpu_start = clock();
+ 
+    // Run optimized CPU implementation using OpenMP
+    cpu_matrix_multiply(h_A, h_B, h_C_cpu, batch_size, m, n, k, l);
+ 
+    clock_t cpu_end = clock();
+    cpu_time = ((double)(cpu_end - cpu_start)) / CLOCKS_PER_SEC * 1000.0;
+    printf("   Computation Time: %.3f ms\n", cpu_time);
+    printf("   GFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (cpu_time * 1000000.0));
+    
+    // Get and print the number of OpenMP threads used
+    int max_threads = omp_get_max_threads();
+    printf("   Number of Threads: %d\n", max_threads);
+ 
+    // Verify CPU results against baseline
+    bool cpu_matches = true;
+    float cpu_max_diff = 0.0f;
+    for (size_t i = 0; i < total_elements_C; i++) {
+        float diff = fabs(h_C_cpu[i] - h_C_original[i]);  // Now compare against h_C_original
+        cpu_max_diff = max(cpu_max_diff, diff);
+        if (diff > 1e-4) {  // More lenient tolerance for CPU implementation
+            cpu_matches = false;
+            break;
+        }
+    }
+    printf("   Accuracy Check: %s (max diff: %e)\n",
+           cpu_matches ? "PASSED" : "FAILED", cpu_max_diff);
+
+    free(h_C_cpu);
     
     //------------------------------------------------------------------------------
     // Test 2: Shared Memory Implementation.
@@ -637,8 +741,9 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     printf("   Memory Transfer (D2H): %.3f ms\n", shared_result_time);  // Print D2H time.
     printf("   Total Time: %.3f ms\n", shared_transfer_time + shared_compute_time + shared_result_time);  // Print total time.
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (shared_compute_time * 1000000000.0));  // Compute and print TFLOPS.
+    printf("   Speedup vs Test 0 (CPU): %.2fx\n", cpu_time / shared_compute_time);
     printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / shared_compute_time);  // Compute speedup over naive kernel.
-    
+
     bool shared_mem_matches = true;  // Initialize flag for accuracy checking.
     float shared_mem_max_diff = 0.0f;  // Initialize variable to track maximum difference.
     for (size_t i = 0; i < total_elements_C; i++) {  // Loop over every element in the output.
@@ -719,6 +824,8 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     printf("   Memory Transfer (D2H): %.3f ms\n", cublas_result_time);  // Print D2H time.
     printf("   Total Time: %.3f ms\n", tc_time + cublas_result_time);  // Print total time.
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tc_time * 1000000000.0));  // Compute and print TFLOPS.
+
+    printf("   Speedup vs Test 0 (CPU): %.2fx\n", cpu_time / tc_time);
     printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / tc_time);  // Compute speedup over naive kernel.
     printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / tc_time);  // Compute speedup over shared memory kernel.
     
@@ -768,6 +875,8 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
         printf("   Memory Transfer (D2H): %.3f ms\n", vec_result_time);  // Print D2H time.
         printf("   Total Time: %.3f ms\n", vec_transfer_time + vectorized_time + vec_result_time);  // Print total time.
         printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (vectorized_time * 1000000000.0));  // Compute and print TFLOPS.
+
+        printf("   Speedup vs Test 0 (CPU): %.2fx\n", cpu_time / vectorized_time);
         printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / vectorized_time);  // Compute speedup over naive.
         printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / vectorized_time);  // Compute speedup over shared memory.
         printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / vectorized_time);  // Compute speedup over cuBLAS.
@@ -818,7 +927,9 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     // Print overall performance metrics
     printf("   Total Time: %.3f ms\n", warp_transfer_time + warp_time + warp_result_time);  // Print total execution time
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (warp_time * 1000000000.0));  // Compute and print TFLOPS
-    printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / warp_time);  // Compute speedup over naive kernel
+
+    printf("   Speedup vs Test 0 (Naive): %.2fx\n", original_time / warp_time);
+    printf("   Speedup vs Test 1 (CPU): %.2fx\n", cpu_time / warp_time);  // Compute speedup over naive kernel
     printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / warp_time);  // Compute speedup over shared memory kernel
     printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / warp_time);  // Compute speedup over cuBLAS
     printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / warp_time);  // Compute speedup over vectorized implementation
@@ -869,7 +980,9 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     printf("   Memory Transfer (D2H): %.3f ms\n", buf_result_time);  // Print D2H transfer time
     printf("   Total Time: %.3f ms\n", buf_transfer_time + buffered_time + buf_result_time);  // Print total execution time
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (buffered_time * 1000000000.0));  // Calculate and print TFLOPS
-    printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / buffered_time);  // Compare against naive
+
+    printf("   Speedup vs Test 0 (Naive): %.2fx\n", original_time / buffered_time);
+    printf("   Speedup vs Test 1 (CPU): %.2fx\n", cpu_time / buffered_time);  // Compare against naive
     printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / buffered_time);  // Compare against shared memory
     printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / buffered_time);  // Compare against cuBLAS
     printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / buffered_time);  // Compare against vectorized
@@ -967,7 +1080,9 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
         printf("   Memory Transfer (D2H): %.3f ms\n", tensor_result_time);  // Print D2H transfer time
         printf("   Total Time: %.3f ms\n", tensor_transfer_time + tensor_time + tensor_result_time);  // Print total time
         printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (tensor_time * 1000000000.0));  // Print TFLOPS
-        printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / tensor_time);  // Print speedup vs naive
+
+        printf("   Speedup vs Test 0 (Naive): %.2fx\n", original_time / tensor_time);
+        printf("   Speedup vs Test 1 (CPU): %.2fx\n", cpu_time / tensor_time);  // Print speedup vs naive
         printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / tensor_time);  // Print speedup vs shared
         printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / tensor_time);  // Print speedup vs cuBLAS
         printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / tensor_time);  // Print speedup vs vectorized
@@ -981,8 +1096,12 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     // Final Performance Summary.
     //------------------------------------------------------------------------------
     printf("\n=== Performance Summary ===\n");  // Print summary header.
-    printf("1. Naive Implementation:\n");  // Print label.
-    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n", original_time, transfer_time, result_time, transfer_time + original_time + result_time);  // Print metrics.
+    printf("0. Naive Implementation:\n");
+    printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n", 
+           original_time, transfer_time, result_time, transfer_time + original_time + result_time);
+    
+    printf("1. CPU Implementation (OpenMP):\n");
+    printf("   Computation: %.3f ms\n", cpu_time);
     
     printf("2. Shared Memory Implementation:\n");  // Print label.
     printf("   Computation: %.3f ms, Memory H2D: %.3f ms, D2H: %.3f ms, Total: %.3f ms\n", shared_compute_time, shared_transfer_time, shared_result_time, shared_transfer_time + shared_compute_time + shared_result_time);  // Print metrics.
