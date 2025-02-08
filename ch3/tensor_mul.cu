@@ -865,16 +865,15 @@ int main(int argc, char **argv) {  // Start of the main function; argc holds arg
     cudaEventRecord(stop);   // Stop timing D2H transfer
     cudaEventSynchronize(stop);  // Wait for transfer to complete
     cudaEventElapsedTime(&buf_result_time, start, stop);  // Calculate D2H transfer time
-    printf("   Memory Transfer (D2H): %.3f ms\n", buf_result_time);  // Print D2H transfer time
     
-    // Print overall performance metrics
+    printf("   Memory Transfer (D2H): %.3f ms\n", buf_result_time);  // Print D2H transfer time
     printf("   Total Time: %.3f ms\n", buf_transfer_time + buffered_time + buf_result_time);  // Print total execution time
     printf("   TFLOPS: %.2f\n", (2.0 * batch_size * m * n * l) / (buffered_time * 1000000000.0));  // Calculate and print TFLOPS
-    printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / buffered_time);  // Compare performance against naive implementation
-    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / buffered_time);  // Compare against shared memory version
-    printf("   Speedup vs Test 3 (Warp): %.2fx\n", warp_time / buffered_time);  // Compare against warp-optimized version
-    printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / buffered_time);  // Compare against vectorized version
-    printf("   Speedup vs Test 5 (Tensor Core): %.2fx\n", tc_time / buffered_time);  // Compare against tensor core version
+    printf("   Speedup vs Test 1 (Naive): %.2fx\n", original_time / buffered_time);  // Compare against naive
+    printf("   Speedup vs Test 2 (Shared Memory): %.2fx\n", shared_compute_time / buffered_time);  // Compare against shared memory
+    printf("   Speedup vs Test 3 (cuBLAS): %.2fx\n", tc_time / buffered_time);  // Compare against cuBLAS
+    printf("   Speedup vs Test 4 (Vectorized): %.2fx\n", vectorized_time / buffered_time);  // Compare against vectorized
+    printf("   Speedup vs Test 5 (Warp-Optimized): %.2fx\n", warp_time / buffered_time);  // Compare against warp
     
     bool buffered_matches = true;  // Initialize flag for double-buffered accuracy check.
     float buffered_max_diff = 0.0f;  // Initialize variable for maximum difference.
