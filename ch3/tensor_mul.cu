@@ -225,14 +225,24 @@ PerfMetrics runTestCublas(const float* h_A, const float* h_B, float* h_C,
     PerfMetrics pm = {0};
     cublasHandle_t handle;
     cublasCreate(&handle);
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    float elapsed;
 
     float *d_A, *d_B, *d_C;
     cudaMalloc((void**)&d_A, batch_size * m * n * sizeof(float));
     cudaMalloc((void**)&d_B, batch_size * n * l * sizeof(float));
     cudaMalloc((void**)&d_C, batch_size * m * l * sizeof(float));
 
+    // Time H2D transfers
+    cudaEventRecord(start);
     cudaMemcpy(d_A, h_A, batch_size * m * n * sizeof(float), cudaMemcpyHostToDevice);
     cudaMemcpy(d_B, h_B, batch_size * n * l * sizeof(float), cudaMemcpyHostToDevice);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed, start, stop);
+    pm.transferTime = elapsed;
 
     float alpha = 1.0f, beta = 0.0f;
     // cuBLAS uses column-major ordering. This call transposes the operation so that
@@ -242,9 +252,6 @@ PerfMetrics runTestCublas(const float* h_A, const float* h_B, float* h_C,
     long long strideB = n * l;
     long long strideC = m * l;
 
-    cudaEvent_t start, stop;
-    cudaEventCreate(&start);
-    cudaEventCreate(&stop);
     cudaEventRecord(start);
 
     cublasSgemmStridedBatched(handle, CUBLAS_OP_N, CUBLAS_OP_N,
@@ -257,23 +264,27 @@ PerfMetrics runTestCublas(const float* h_A, const float* h_B, float* h_C,
 
     cudaEventRecord(stop);
     cudaEventSynchronize(stop);
-    float elapsed;
     cudaEventElapsedTime(&elapsed, start, stop);
     pm.kernelTime = elapsed;
 
+    // Time D2H transfer
+    cudaEventRecord(start);
     cudaMemcpy(h_C, d_C, batch_size * m * l * sizeof(float), cudaMemcpyDeviceToHost);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+    cudaEventElapsedTime(&elapsed, start, stop);
+    pm.d2hTime = elapsed;
 
-    pm.totalTime = pm.kernelTime; // excluding transfers for simplicity
-    pm.transferTime = 0;
-    pm.d2hTime = 0;
+    pm.totalTime = pm.transferTime + pm.kernelTime + pm.d2hTime;
     pm.gflops = (2.0f * batch_size * m * n * l) / (pm.kernelTime * 1e6f);
+
+    printf("Test 3: cuBLAS Implementation:\n");
+    printf("   H2D: %.3f ms, Kernel: %.3f ms, D2H: %.3f ms, Total: %.3f ms, GFLOPS: %.2f\n",
+           pm.transferTime, pm.kernelTime, pm.d2hTime, pm.totalTime, pm.gflops);
 
     cublasDestroy(handle);
     cudaFree(d_A); cudaFree(d_B); cudaFree(d_C);
     cudaEventDestroy(start); cudaEventDestroy(stop);
-
-    printf("Test 3: cuBLAS Implementation:\n");
-    printf("   Kernel: %.3f ms, GFLOPS: %.2f\n", pm.kernelTime, pm.gflops);
 
     return pm;
 }
