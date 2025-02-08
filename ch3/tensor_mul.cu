@@ -573,7 +573,53 @@ __device__ void tensor_mul_device(const float* A, const float* B, float* C,
 // Test 2: Shared Memory Implementation (Placeholder)
 __global__ void tensor_mul_shared(const float* A, const float* B, float* C,
                                   int batch_size, int m, int n, int k, int l) {
-    tensor_mul_device(A, B, C, batch_size, m, n, k, l);
+    int batch = blockIdx.z;
+    int row = blockIdx.x * blockDim.x + threadIdx.x;
+    int col = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    // Shared memory tiles
+    __shared__ float As[TILE_SIZE][TILE_SIZE];
+    __shared__ float Bs[TILE_SIZE][TILE_SIZE];
+    
+    // Calculate indices
+    int tx = threadIdx.x;
+    int ty = threadIdx.y;
+    
+    // Accumulator for the result
+    float sum = 0.0f;
+    
+    // Loop over tiles
+    for (int t = 0; t < (n + TILE_SIZE - 1) / TILE_SIZE; t++) {
+        // Load tiles into shared memory
+        if (row < m && t * TILE_SIZE + ty < n) {
+            As[tx][ty] = A[batch * m * n + row * n + t * TILE_SIZE + ty];
+        } else {
+            As[tx][ty] = 0.0f;
+        }
+        
+        if (t * TILE_SIZE + tx < n && col < l) {
+            Bs[tx][ty] = B[batch * k * l + (t * TILE_SIZE + tx) * l + col];
+        } else {
+            Bs[tx][ty] = 0.0f;
+        }
+        
+        // Synchronize to ensure tiles are loaded
+        __syncthreads();
+        
+        // Compute partial dot product for this tile
+        #pragma unroll
+        for (int k = 0; k < TILE_SIZE; k++) {
+            sum += As[tx][k] * Bs[k][ty];
+        }
+        
+        // Synchronize before loading next tile
+        __syncthreads();
+    }
+    
+    // Write result
+    if (row < m && col < l) {
+        C[batch * m * l + row * l + col] = sum;
+    }
 }
 
 // Test 4: Vectorized Implementation (using regular floats)
