@@ -1,4 +1,3 @@
-
 // compile with:nvcc -O3 -arch=sm_86 -std=c++20 --use_fast_math -Xcompiler "-fopenmp -fPIC -pthread -march=native" tensor_mul.cu -o tensor_mul -lcublas
 
 //------------------------------------------------------------------------------
@@ -509,138 +508,6 @@ __global__ void tensor_mul_tensorcore_float(const float* __restrict__ A,
     }
 }
 
-//------------------------------------------------------------------------------
-// Main: Orchestrate all tests and print a summary.
-//------------------------------------------------------------------------------
-int main(int argc, char** argv) {
-    if (argc != 6) {
-        printf("Usage: ./tensor_mul <batch_size> <m> <n> <k> <l>\n");
-        return 1;
-    }
-    int batch_size = atoi(argv[1]);
-    int m = atoi(argv[2]);
-    int n = atoi(argv[3]);
-    int k = atoi(argv[4]);
-    int l = atoi(argv[5]);
-    if (batch_size <= 0 || m <= 0 || n <= 0 || k <= 0 || l <= 0) {
-        printf("Error: All dimensions must be positive integers.\n");
-        return 1;
-    }
-    
-    size_t total_elements_A = batch_size * m * n;
-    size_t total_elements_B = batch_size * k * l;
-    size_t total_elements_C = batch_size * m * l;
-    
-    // Allocate host matrices.
-    float *h_A = (float*)malloc(total_elements_A * sizeof(float));
-    float *h_B = (float*)malloc(total_elements_B * sizeof(float));
-    // For baseline from GPU test 0.
-    float *h_C_baseline = (float*)malloc(total_elements_C * sizeof(float));
-    // Temporary output array for other tests.
-    float *h_C_temp = (float*)malloc(total_elements_C * sizeof(float));
-    if (!h_A || !h_B || !h_C_baseline || !h_C_temp) {
-        printf("Error: Host memory allocation failed.\n");
-        return 1;
-    }
-    srand(time(NULL));
-    initMatrices(h_A, h_B, batch_size, m, n, k, l);
-    
-    // Test 0: Naive GPU Implementation (baseline)
-    PerfMetrics pm0 = runTestNaive(h_A, h_B, h_C_baseline, batch_size, m, n, k, l);
-    printf("\n");
-    
-    // Test 1: CPU Implementation using OpenMP.
-    double t_cpu_start = clock();
-    cpu_matrix_multiply(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    double cpu_time = (clock() - t_cpu_start) / (double)CLOCKS_PER_SEC * 1000.0;
-    printf("Test 1: CPU Implementation (OpenMP):\n   Computation: %.3f ms\n", cpu_time);
-    float tol = 1e-3f;  // Relaxed tolerance to 1e-3 for CPU check.
-    float max_diff_cpu = checkResults(h_C_baseline, h_C_temp, total_elements_C, tol);
-    if (max_diff_cpu <= tol)
-        printf("   Accuracy Check: PASSED (max diff: %e)\n", max_diff_cpu);
-    else
-        printf("   Accuracy Check: FAILED (max diff: %e)\n", max_diff_cpu);
-    printf("\n");
-    
-    // Test 2: Shared Memory Implementation.
-    PerfMetrics pm2 = runTestSharedMemory(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    float diff2 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
-    printf("Test 2: Shared Memory Implementation: Accuracy (max diff: %e)\n", diff2);
-    printf("\n");
-    
-    // Test 3: cuBLAS Implementation.
-    PerfMetrics pm3 = runTestCublas(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    float diff3 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
-    printf("Test 3: cuBLAS Implementation: Accuracy (max diff: %e)\n", diff3);
-    printf("\n");
-    
-    // Test 4: Vectorized Implementation.
-    PerfMetrics pm4 = runTestVectorized(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    float diff4 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
-    printf("Test 4: Vectorized Implementation: Accuracy (max diff: %e)\n", diff4);
-    printf("\n");
-    
-    // Test 5: Warp-Optimized Implementation.
-    PerfMetrics pm5 = runTestWarpOptimized(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    float diff5 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
-    printf("Test 5: Warp-Optimized Implementation: Accuracy (max diff: %e)\n", diff5);
-    printf("\n");
-    
-    // Test 6: Double-Buffered Implementation.
-    PerfMetrics pm6 = runTestDoubleBuffered(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    float diff6 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
-    printf("Test 6: Double-Buffered Implementation: Accuracy (max diff: %e)\n", diff6);
-    printf("\n");
-    
-    // Test 7: Tensor Core Implementation.
-    PerfMetrics pm7 = runTestTensorCore(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
-    float diff7 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 2e-2f);
-    printf("Test 7: Tensor Core Implementation: Accuracy (max diff: %e)\n", diff7);
-    printf("\n");
-    
-    //------------------------------------------------------------------------------    
-    // Performance Summary.
-    //------------------------------------------------------------------------------
-    printf("\n=== Performance Summary ===\n");
-    printf("Tensor Dimensions: [%d × %d × %d] × [%d × %d × %d]\n", 
-           batch_size, m, n, batch_size, k, l);
-    printf("--------------------------------------------------------------------------------\n");
-    printf("Implementation      Time (ms)        GFLOPS       vs Naive        vs CPU\n");
-    printf("--------------------------------------------------------------------------------\n");
-    printf("0. Naive GPU       %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm0.totalTime, pm0.gflops, 1.0f, cpu_time/pm0.totalTime);
-    printf("1. CPU (OpenMP)    %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           cpu_time, (2.0f * batch_size * m * n * l) / (cpu_time * 1e6f), 
-           pm0.totalTime/cpu_time, 1.0f);
-    printf("2. Shared Memory   %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm2.totalTime, pm2.gflops, pm0.totalTime/pm2.totalTime, 
-           cpu_time/pm2.totalTime);
-    printf("3. cuBLAS          %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm3.totalTime, pm3.gflops, pm0.totalTime/pm3.totalTime, 
-           cpu_time/pm3.totalTime);
-    printf("4. Vectorized      %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm4.totalTime, pm4.gflops, pm0.totalTime/pm4.totalTime, 
-           cpu_time/pm4.totalTime);
-    printf("5. Warp-Optimized  %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm5.totalTime, pm5.gflops, pm0.totalTime/pm5.totalTime, 
-           cpu_time/pm5.totalTime);
-    printf("6. Double-Buffered %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm6.totalTime, pm6.gflops, pm0.totalTime/pm6.totalTime, 
-           cpu_time/pm6.totalTime);
-    printf("7. Tensor Core     %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
-           pm7.totalTime, pm7.gflops, pm0.totalTime/pm7.totalTime, 
-           cpu_time/pm7.totalTime);
-    
-    // Cleanup.
-    free(h_A);
-    free(h_B);
-    free(h_C_baseline);
-    free(h_C_temp);
-    cudaFree(0);  // Reset device.
-    
-    return 0;
-}
-
 // Test 0: Naive GPU kernel implementation
 __global__ void tensor_mul(const float* A, const float* B, float* C,
                            int batch_size, int m, int n, int k, int l) {
@@ -910,4 +777,126 @@ __global__ void tensor_mul_tensorcore(const float* A, const float* B, float* C,
         }
     }
 #endif
+}
+
+//------------------------------------------------------------------------------
+// Main: Orchestrate all tests and print a summary.
+//------------------------------------------------------------------------------
+int main(int argc, char** argv) {
+    if (argc != 6) {
+        printf("Usage: ./tensor_mul <batch_size> <m> <n> <k> <l>\n");
+        return 1;
+    }
+    int batch_size = atoi(argv[1]);
+    int m = atoi(argv[2]);
+    int n = atoi(argv[3]);
+    int k = atoi(argv[4]);
+    int l = atoi(argv[5]);
+    if (batch_size <= 0 || m <= 0 || n <= 0 || k <= 0 || l <= 0) {
+        printf("Error: All dimensions must be positive integers.\n");
+        return 1;
+    }
+    
+    size_t total_elements_A = batch_size * m * n;
+    size_t total_elements_B = batch_size * k * l;
+    size_t total_elements_C = batch_size * m * l;
+    
+    // Allocate host matrices
+    float *h_A = (float*)malloc(total_elements_A * sizeof(float));
+    float *h_B = (float*)malloc(total_elements_B * sizeof(float));
+    float *h_C_baseline = (float*)malloc(total_elements_C * sizeof(float));
+    float *h_C_temp = (float*)malloc(total_elements_C * sizeof(float));
+    if (!h_A || !h_B || !h_C_baseline || !h_C_temp) {
+        printf("Error: Host memory allocation failed.\n");
+        return 1;
+    }
+    
+    srand(time(NULL));
+    initMatrices(h_A, h_B, batch_size, m, n, k, l);
+    
+    // Run all tests
+    PerfMetrics pm0 = runTestNaive(h_A, h_B, h_C_baseline, batch_size, m, n, k, l);
+    printf("\n");
+    
+    double t_cpu_start = clock();
+    cpu_matrix_multiply(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    double cpu_time = (clock() - t_cpu_start) / (double)CLOCKS_PER_SEC * 1000.0;
+    printf("Test 1: CPU Implementation (OpenMP):\n   Computation: %.3f ms\n", cpu_time);
+    float tol = 1e-3f;
+    float max_diff_cpu = checkResults(h_C_baseline, h_C_temp, total_elements_C, tol);
+    if (max_diff_cpu <= tol)
+        printf("   Accuracy Check: PASSED (max diff: %e)\n", max_diff_cpu);
+    else
+        printf("   Accuracy Check: FAILED (max diff: %e)\n", max_diff_cpu);
+    printf("\n");
+    
+    PerfMetrics pm2 = runTestSharedMemory(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    float diff2 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
+    printf("Test 2: Shared Memory Implementation: Accuracy (max diff: %e)\n", diff2);
+    printf("\n");
+    
+    PerfMetrics pm3 = runTestCublas(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    float diff3 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
+    printf("Test 3: cuBLAS Implementation: Accuracy (max diff: %e)\n", diff3);
+    printf("\n");
+    
+    PerfMetrics pm4 = runTestVectorized(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    float diff4 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
+    printf("Test 4: Vectorized Implementation: Accuracy (max diff: %e)\n", diff4);
+    printf("\n");
+    
+    PerfMetrics pm5 = runTestWarpOptimized(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    float diff5 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
+    printf("Test 5: Warp-Optimized Implementation: Accuracy (max diff: %e)\n", diff5);
+    printf("\n");
+    
+    PerfMetrics pm6 = runTestDoubleBuffered(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    float diff6 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 1e-5f);
+    printf("Test 6: Double-Buffered Implementation: Accuracy (max diff: %e)\n", diff6);
+    printf("\n");
+    
+    PerfMetrics pm7 = runTestTensorCore(h_A, h_B, h_C_temp, batch_size, m, n, k, l);
+    float diff7 = checkResults(h_C_baseline, h_C_temp, total_elements_C, 2e-2f);
+    printf("Test 7: Tensor Core Implementation: Accuracy (max diff: %e)\n", diff7);
+    printf("\n");
+    
+    // Print performance summary
+    printf("\n=== Performance Summary ===\n");
+    printf("Tensor Dimensions: [%d × %d × %d] × [%d × %d × %d]\n", 
+           batch_size, m, n, batch_size, k, l);
+    printf("--------------------------------------------------------------------------------\n");
+    printf("Implementation      Time (ms)        GFLOPS       vs Naive        vs CPU\n");
+    printf("--------------------------------------------------------------------------------\n");
+    printf("0. Naive GPU       %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm0.totalTime, pm0.gflops, 1.0f, cpu_time/pm0.totalTime);
+    printf("1. CPU (OpenMP)    %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           cpu_time, (2.0f * batch_size * m * n * l) / (cpu_time * 1e6f), 
+           pm0.totalTime/cpu_time, 1.0f);
+    printf("2. Shared Memory   %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm2.totalTime, pm2.gflops, pm0.totalTime/pm2.totalTime, 
+           cpu_time/pm2.totalTime);
+    printf("3. cuBLAS          %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm3.totalTime, pm3.gflops, pm0.totalTime/pm3.totalTime, 
+           cpu_time/pm3.totalTime);
+    printf("4. Vectorized      %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm4.totalTime, pm4.gflops, pm0.totalTime/pm4.totalTime, 
+           cpu_time/pm4.totalTime);
+    printf("5. Warp-Optimized  %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm5.totalTime, pm5.gflops, pm0.totalTime/pm5.totalTime, 
+           cpu_time/pm5.totalTime);
+    printf("6. Double-Buffered %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm6.totalTime, pm6.gflops, pm0.totalTime/pm6.totalTime, 
+           cpu_time/pm6.totalTime);
+    printf("7. Tensor Core     %12.3f    %10.2f    %8.2fx    %10.2fx\n", 
+           pm7.totalTime, pm7.gflops, pm0.totalTime/pm7.totalTime, 
+           cpu_time/pm7.totalTime);
+    
+    // Cleanup
+    free(h_A);
+    free(h_B);
+    free(h_C_baseline);
+    free(h_C_temp);
+    cudaFree(0);
+    
+    return 0;
 }
